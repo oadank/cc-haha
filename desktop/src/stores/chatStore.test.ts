@@ -223,6 +223,63 @@ describe('chatStore history mapping', () => {
     expect(mapped[3]).toMatchObject({ parentToolUseId: 'agent-1' })
   })
 
+  it('maps AskUserQuestion transcript answers from toolUseResult metadata', () => {
+    const messages: MessageEntry[] = [
+      {
+        id: 'assistant-ask',
+        type: 'assistant',
+        timestamp: '2026-04-06T00:00:00.000Z',
+        content: [
+          {
+            type: 'tool_use',
+            name: 'AskUserQuestion',
+            id: 'ask-1',
+            input: {
+              questions: [
+                {
+                  question: 'Pick one?',
+                  options: [{ label: 'A' }, { label: 'B' }],
+                },
+              ],
+            },
+          },
+        ],
+      },
+      {
+        id: 'user-answer',
+        type: 'tool_result',
+        timestamp: '2026-04-06T00:00:01.000Z',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'ask-1',
+            content: 'User has answered your questions: "Pick one?"="A". You can now continue with the user\'s answers in mind.',
+          },
+        ],
+        toolUseResult: {
+          questions: [
+            {
+              question: 'Pick one?',
+              options: [{ label: 'A' }, { label: 'B' }],
+            },
+          ],
+          answers: { 'Pick one?': 'A' },
+        },
+      },
+    ]
+
+    const mapped = mapHistoryMessagesToUiMessages(messages)
+
+    expect(mapped).toHaveLength(2)
+    expect(mapped[1]).toMatchObject({
+      type: 'tool_result',
+      toolUseId: 'ask-1',
+      content: {
+        answers: { 'Pick one?': 'A' },
+      },
+    })
+  })
+
   it('maps compact boundary and summary history without hiding pre-compact messages', () => {
     const messages: MessageEntry[] = [
       {
@@ -1272,6 +1329,123 @@ describe('chatStore history mapping', () => {
         parentToolUseId: 'agent-1',
       },
     ])
+  })
+
+  it('renders a pending tool call as soon as the tool stream starts', () => {
+    vi.useFakeTimers()
+
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession(),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_start',
+      blockType: 'tool_use',
+      toolName: 'Write',
+      toolUseId: 'write-1',
+    })
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages).toMatchObject([
+      {
+        type: 'tool_use',
+        toolName: 'Write',
+        toolUseId: 'write-1',
+        input: {},
+        isPending: true,
+      },
+    ])
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_delta',
+      toolInput: '{"file_path":"/private/tmp/ai-code-novel.md","content":"第一章',
+    })
+    vi.advanceTimersByTime(60)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages).toMatchObject([
+      {
+        type: 'tool_use',
+        toolName: 'Write',
+        toolUseId: 'write-1',
+        input: { file_path: '/private/tmp/ai-code-novel.md' },
+        isPending: true,
+        partialInput: '{"file_path":"/private/tmp/ai-code-novel.md","content":"第一章',
+      },
+    ])
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'tool_use_complete',
+      toolName: 'Write',
+      toolUseId: 'write-1',
+      input: {
+        file_path: '/private/tmp/ai-code-novel.md',
+        content: '第一章\n正文',
+      },
+    })
+
+    const messages = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages ?? []
+    const toolMessages = messages.filter((message) => message.type === 'tool_use')
+    expect(toolMessages).toHaveLength(1)
+    expect(toolMessages[0]).toMatchObject({
+      type: 'tool_use',
+      toolName: 'Write',
+      toolUseId: 'write-1',
+      input: {
+        file_path: '/private/tmp/ai-code-novel.md',
+        content: '第一章\n正文',
+      },
+      isPending: false,
+    })
+    expect(toolMessages[0]).not.toHaveProperty('partialInput')
+
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+  })
+
+  it('batches streaming tool input deltas before updating the pending card', () => {
+    vi.useFakeTimers()
+
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession(),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_start',
+      blockType: 'tool_use',
+      toolName: 'Write',
+      toolUseId: 'write-1',
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_delta',
+      toolInput: '{"file_path":"/private/tmp/story.md","content":"第一',
+    })
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_delta',
+      toolInput: '章\\n第二段',
+    })
+
+    const beforeFlush = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages[0]
+    expect(beforeFlush).toMatchObject({
+      type: 'tool_use',
+      isPending: true,
+      input: {},
+      partialInput: '',
+    })
+
+    vi.advanceTimersByTime(60)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages[0]).toMatchObject({
+      type: 'tool_use',
+      input: { file_path: '/private/tmp/story.md' },
+      partialInput: '{"file_path":"/private/tmp/story.md","content":"第一章\\n第二段',
+    })
+
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
   })
 
   it('refreshes merged slash commands when a live CLI update omits project commands', async () => {
