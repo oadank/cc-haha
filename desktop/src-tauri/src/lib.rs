@@ -217,6 +217,8 @@ mod macos_notifications {
     }
 }
 
+mod webview_panel;
+
 const SERVER_STARTUP_LOG_LIMIT: usize = 80;
 const SERVER_BIND_HOST: &str = "0.0.0.0";
 const SERVER_CONTROL_HOST: &str = "127.0.0.1";
@@ -229,6 +231,9 @@ const APP_MODE_FILE: &str = "app-mode.json";
 const MIN_WINDOW_WIDTH: u32 = 960;
 const MIN_WINDOW_HEIGHT: u32 = 640;
 const MIN_VISIBLE_PIXELS: i64 = 64;
+// Keep this above the server's CLI shutdown wait. The server gives each CLI
+// session enough time to run gracefulShutdown cleanup before it escalates.
+const SIDECAR_GRACEFUL_TERMINATION_TIMEOUT: Duration = Duration::from_millis(8_000);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -286,11 +291,22 @@ fn dir_has_portable_data(dir: &Path) -> bool {
     if !dir.is_dir() {
         return false;
     }
-    [WINDOW_STATE_FILE, TERMINAL_CONFIG_FILE]
+    [
+        "settings.json",
+        ".claude.json",
+        ".mcp.json",
+        WINDOW_STATE_FILE,
+        TERMINAL_CONFIG_FILE,
+    ]
         .iter()
         .any(|f| dir.join(f).is_file())
         || dir.join("Cache").is_dir()
         || dir.join("EBWebView").is_dir()
+        || dir.join("projects").is_dir()
+        || dir.join("skills").is_dir()
+        || dir.join("plugins").is_dir()
+        || dir.join("cowork_plugins").is_dir()
+        || dir.join("cc-haha").is_dir()
 }
 
 /// Resolve the default portable config directory: exe_dir/CLAUDE_CONFIG_DIR.
@@ -1321,9 +1337,13 @@ fn resolve_terminal_cwd(cwd: Option<String>) -> Result<PathBuf, String> {
         }
     }) {
         Some(path) => path,
-        None => home_dir().unwrap_or(
-            std::env::current_dir().map_err(|err| format!("resolve current directory: {err}"))?,
-        ),
+        None => std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(home_dir)
+            .unwrap_or(
+                std::env::current_dir()
+                    .map_err(|err| format!("resolve current directory: {err}"))?,
+            ),
     };
 
     if path.is_dir() {
@@ -1638,7 +1658,7 @@ fn start_server_sidecar(app: &AppHandle) -> Result<ServerRuntime, String> {
     });
 
     if let Err(err) = wait_for_server(control_host, port) {
-        let _ = child.kill();
+        kill_sidecar_child(child);
         return Err(format_server_startup_error(&err, &startup_logs));
     }
 
@@ -1655,7 +1675,7 @@ fn stop_server_sidecar(app: &AppHandle) {
     };
 
     if let Some(runtime) = guard.runtime.take() {
-        let _ = runtime.child.kill();
+        kill_sidecar_child(runtime.child);
     }
 }
 
@@ -1782,8 +1802,71 @@ fn stop_adapters_sidecar(app: &AppHandle) {
         return;
     };
     for child in guard.drain(..) {
+        kill_sidecar_child(child);
+    }
+}
+
+fn kill_sidecar_child(child: CommandChild) {
+    #[cfg(target_os = "windows")]
+    {
+        let pid = child.pid().to_string();
+        if StdCommand::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        terminate_unix_sidecar_child(child);
+    }
+
+    #[cfg(not(unix))]
+    {
         let _ = child.kill();
     }
+}
+
+#[cfg(unix)]
+fn terminate_unix_sidecar_child(child: CommandChild) {
+    let pid = child.pid();
+    let pid_text = pid.to_string();
+
+    // tauri-plugin-shell's CommandChild::kill() maps to SIGKILL on Unix.
+    // Give bundled sidecars a SIGTERM window first so the server can stop
+    // CLI sessions it spawned before the native app exits.
+    let _ = StdCommand::new("kill")
+        .args(["-TERM", &pid_text])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let deadline = Instant::now() + SIDECAR_GRACEFUL_TERMINATION_TIMEOUT;
+    while Instant::now() < deadline {
+        if !is_unix_process_running(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn is_unix_process_running(pid: u32) -> bool {
+    StdCommand::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -1838,8 +1921,9 @@ fn kill_windows_sidecars() {
 mod tests {
     use super::{
         decode_terminal_output, default_utf8_locale, ensure_utf8_locale,
-        has_meaningful_intersection, is_persistable_window_state, normalize_terminal_bash_path,
-        parse_env_block, resolve_desktop_terminal_shell, run_notification_bridge,
+        dir_has_portable_data, has_meaningful_intersection, is_persistable_window_state,
+        normalize_terminal_bash_path, parse_env_block, resolve_desktop_terminal_shell,
+        resolve_terminal_cwd, run_notification_bridge,
         select_h5_dist_dir, DesktopTerminalConfig, StoredWindowState, TerminalHostPlatform,
         SERVER_BIND_HOST, SERVER_CONTROL_HOST,
     };
@@ -2018,6 +2102,42 @@ mod tests {
     }
 
     #[test]
+    fn terminal_cwd_defaults_to_portable_config_dir_when_present() {
+        let original = std::env::var_os("CLAUDE_CONFIG_DIR");
+        let dir = std::env::temp_dir().join(format!(
+            "cchh-terminal-portable-cwd-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create portable config dir");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &dir);
+
+        let cwd = resolve_terminal_cwd(None).expect("portable cwd should resolve");
+
+        assert_eq!(cwd, dir);
+
+        if let Some(value) = original {
+            std::env::set_var("CLAUDE_CONFIG_DIR", value);
+        } else {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
+        fs::remove_dir_all(cwd).expect("remove portable config dir");
+    }
+
+    #[test]
+    fn portable_data_detection_includes_cli_state_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "cchh-portable-data-detect-{}",
+            std::process::id()
+        ));
+        let skills = root.join("skills");
+        fs::create_dir_all(&skills).expect("create skills dir");
+
+        assert!(dir_has_portable_data(&root));
+
+        fs::remove_dir_all(root).expect("remove portable data fixture");
+    }
+
+    #[test]
     fn desktop_terminal_shell_resolution_keeps_system_default_without_preference() {
         assert_eq!(
             resolve_desktop_terminal_shell(TerminalHostPlatform::Windows, None, "powershell.exe",)
@@ -2105,6 +2225,7 @@ pub fn run() {
         .manage(AdapterState::default())
         .manage(TerminalState::default())
         .manage(AppExitState::default())
+        .manage(webview_panel::PreviewState::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
@@ -2129,7 +2250,14 @@ pub fn run() {
             get_app_mode,
             set_app_mode,
             detect_portable_dir,
-            set_app_zoom
+            set_app_zoom,
+            webview_panel::preview_open,
+            webview_panel::preview_navigate,
+            webview_panel::preview_set_bounds,
+            webview_panel::preview_set_visible,
+            webview_panel::preview_close,
+            webview_panel::preview_message,
+            webview_panel::preview_eval
         ]);
 
     // macOS: native menu bar (traffic-light overlay style)
