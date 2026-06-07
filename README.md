@@ -185,6 +185,87 @@ cp .env.example .env
 | API | Anthropic SDK |
 | 协议 | MCP, LSP |
 
+
+---
+
+## Linux 无头模式调用方案（agents-to-im / daemon 场景）
+
+### 问题背景
+
+cc-haha 提供两种 CLI 调用方式：
+
+| 方式 | 路径 | 问题 |
+|------|------|------|
+| **编译二进制** | `claude-sidecar` (ELF) | `--version` 输出乱码，daemon 无法识别版本，不启动子进程 |
+| **bun + 源码** | `bun ./src/entrypoints/cli.tsx` | ✅ 正常工作 |
+
+### 正确的 wrapper 脚本
+
+将以下内容写入 `/usr/local/bin/claude`（需 root）：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="/root/.bun/bin:$PATH"
+export CLAUDE_HOME=/opt/.claude
+ROOT_DIR=/opt/cc-haha
+export CALLER_DIR="/opt"
+
+cd "$ROOT_DIR" || exit 1
+export IS_SANDBOX=1
+unset ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN
+unset ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL
+
+if [[ "$#" -gt 0 && "$1" == "--recovery" ]]; then
+  exec bun --env-file=.env ./src/localRecoveryCli.ts --dangerously-skip-permissions "${@:2}"
+fi
+
+if [[ $# -gt 0 ]]; then
+  if [[ "$1" != -* ]]; then
+    exec bun --env-file=.env ./src/entrypoints/cli.tsx --dangerously-skip-permissions --add-dir /root --add-dir /home --add-dir /opt --add-dir /tmp -p "$@"
+  else
+    exec bun --env-file=.env ./src/entrypoints/cli.tsx --dangerously-skip-permissions --add-dir /root --add-dir /home --add-dir /opt --add-dir /tmp "$@"
+  fi
+else
+  exec bun --env-file=.env ./src/entrypoints/cli.tsx --dangerously-skip-permissions --add-dir /root --add-dir /home --add-dir /opt --add-dir /tmp
+fi
+```
+
+```bash
+chmod +x /usr/local/bin/claude
+```
+
+### 关键设计说明
+
+| 要点 | 说明 |
+|------|------|
+| **用 bun 跑源码** | 不走编译二进制，避免 `--version` 乱码和版本检测失败 |
+| **`--dangerously-skip-permissions`** | daemon 以 root 运行时需要此 flag，bun 源码模式下不受 root 限制 |
+| **`--add-dir`** | 授予 CLI 对指定目录的读写权限 |
+| **`unset ANTHROPIC_*`** | CLI 不从环境变量读取 API 配置，改为从运行时 `query()` 注入 |
+| **`IS_SANDBOX=1`** | 标记为沙盒环境，影响 CLI 内部行为 |
+| **`CLAUDE_HOME=/opt/.claude`** | 指定 Claude 配置目录 |
+
+### 验证
+
+```bash
+# 检查版本
+claude --version
+# 期望输出: 999.0.0-local
+
+# 测试对话（通过 agents-to-im daemon 使用时，环境变量由 daemon 注入，无需手动设置）
+claude -p "say hi" --output-format text
+```
+
+### 已知问题
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| `--dangerously-skip-permissions cannot be used with root` | 编译二进制 (claude-sidecar) 新版加了 root 安全检查 | 改用 bun + 源码 wrapper 脚本 |
+| `--version` 输出乱码 | 编译二进制不兼容 | 同上 |
+| daemon 启动后不处理消息 | CLI 子进程立即退出，EPIPE 导致 daemon 崩溃 | 同上 |
+
 ## 感谢
 
 感谢以下开源项目和社区实践为本项目提供参考与启发：
