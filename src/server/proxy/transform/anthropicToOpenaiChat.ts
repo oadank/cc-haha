@@ -14,12 +14,14 @@ import type {
   OpenAIToolCall,
   OpenAITool,
 } from './types.js'
+import { stripLeadingBillingHeader } from './billingHeader.js'
 
 type OpenAIChatImageContentMode = 'vision' | 'text_only'
 
 type OpenAIChatTransformOptions = {
   roundTripReasoningContent?: boolean
   passThinkingToggle?: boolean
+  passSamplingParams?: boolean
   imageContentMode?: OpenAIChatImageContentMode
 }
 
@@ -34,12 +36,14 @@ export function anthropicToOpenaiChat(
 ): OpenAIChatRequest {
   const messages: OpenAIChatMessage[] = []
 
-  // Convert system prompt
+  // Convert system prompt, minus the leading billing attribution: its
+  // rotating cch= signature would change the prefix every turn and defeat
+  // upstream prompt caching.
   if (body.system) {
-    if (typeof body.system === 'string') {
-      messages.push({ role: 'system', content: body.system })
-    } else if (Array.isArray(body.system)) {
-      const text = body.system.map((b) => b.text).join('\n')
+    const text = typeof body.system === 'string'
+      ? stripLeadingBillingHeader(body.system)
+      : body.system.map((b) => stripLeadingBillingHeader(b.text)).filter(Boolean).join('\n')
+    if (text) {
       messages.push({ role: 'system', content: text })
     }
   }
@@ -53,16 +57,24 @@ export function anthropicToOpenaiChat(
   const result: OpenAIChatRequest = {
     model: body.model,
     messages,
-    stream: body.stream,
+    stream: body.stream === true,
+  }
+
+  // Many OpenAI-compatible servers omit usage on streams unless asked.
+  if (result.stream) {
+    result.stream_options = { include_usage: true }
   }
 
   // max_tokens — omit to let upstream provider use its own default/max.
   // Claude Code sends very large values (e.g. 128K) that exceed many
   // providers' limits (DeepSeek: 8192, etc.).
 
-  // temperature & top_p
-  if (body.temperature !== undefined) result.temperature = body.temperature
-  if (body.top_p !== undefined) result.top_p = body.top_p
+  // Claude Code sends Anthropic sampling params that some compatible
+  // providers reject. Keep them opt-in for providers known to accept them.
+  if (options.passSamplingParams) {
+    if (body.temperature !== undefined) result.temperature = body.temperature
+    if (body.top_p !== undefined) result.top_p = body.top_p
+  }
 
   // stop_sequences → stop
   if (body.stop_sequences && body.stop_sequences.length > 0) {

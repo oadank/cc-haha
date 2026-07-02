@@ -37,7 +37,7 @@ describe('network settings', () => {
   beforeEach(setup)
   afterEach(teardown)
 
-  it('normalizes missing settings to the 120s system-proxy default', () => {
+  it('normalizes missing settings to the 600s system-proxy default', () => {
     expect(normalizeNetworkSettings({})).toEqual({
       aiRequestTimeoutMs: DEFAULT_AI_REQUEST_TIMEOUT_MS,
       proxy: {
@@ -50,7 +50,7 @@ describe('network settings', () => {
   it('clamps AI request timeouts and trims manual proxy URLs', () => {
     expect(normalizeNetworkSettings({
       network: {
-        aiRequestTimeoutMs: 999_999,
+        aiRequestTimeoutMs: 9_999_999,
         proxy: {
           mode: 'manual',
           url: '  http://127.0.0.1:7890  ',
@@ -96,6 +96,41 @@ describe('network settings', () => {
       HTTPS_PROXY: 'http://127.0.0.1:7890',
       http_proxy: 'http://127.0.0.1:7890',
       https_proxy: 'http://127.0.0.1:7890',
+      NO_PROXY: 'localhost,127.0.0.1,::1',
+      no_proxy: 'localhost,127.0.0.1,::1',
+    })
+  })
+
+  it('preserves custom no_proxy entries while adding loopback bypasses for manual proxies', () => {
+    const settings = normalizeNetworkSettings({
+      network: {
+        proxy: {
+          mode: 'manual',
+          url: 'http://proxy.example:8080',
+        },
+      },
+    })
+
+    expect(buildNetworkEnvironment(settings, { no_proxy: '.corp.local,10.0.0.0/8' })).toMatchObject({
+      NO_PROXY: '.corp.local,10.0.0.0/8,localhost,127.0.0.1,::1',
+      no_proxy: '.corp.local,10.0.0.0/8,localhost,127.0.0.1,::1',
+    })
+  })
+
+  it('preserves authenticated manual proxy URLs for provider requests', () => {
+    const settings = normalizeNetworkSettings({
+      network: {
+        proxy: {
+          mode: 'manual',
+          url: ' https://user:p%40ss@proxy.example.com:8443 ',
+        },
+      },
+    })
+
+    expect(getManualNetworkProxyUrl(settings)).toBe('https://user:p%40ss@proxy.example.com:8443')
+    expect(buildNetworkEnvironment(settings)).toMatchObject({
+      HTTP_PROXY: 'https://user:p%40ss@proxy.example.com:8443',
+      HTTPS_PROXY: 'https://user:p%40ss@proxy.example.com:8443',
     })
   })
 })

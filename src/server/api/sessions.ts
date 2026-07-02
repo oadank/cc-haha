@@ -7,6 +7,8 @@
  *   GET    /api/sessions            — 列出会话
  *   GET    /api/sessions/:id        — 获取会话详情
  *   GET    /api/sessions/:id/messages — 获取会话消息
+ *   GET    /api/sessions/:id/trace — 获取会话级模型调用 trace（body preview 裁剪后的列表视图）
+ *   GET    /api/sessions/:id/trace/calls/:callId — 获取单次调用的完整 trace 记录
  *   GET    /api/sessions/:id/turn-checkpoints — 获取按轮次保留的 checkpoint 预览
  *   GET    /api/sessions/:id/turn-checkpoints/diff — 获取绑定到指定 checkpoint 的 diff
  *   POST   /api/sessions            — 创建新会话
@@ -38,7 +40,9 @@ import {
   createSessionBranch,
   SessionBranchingError,
 } from '../../utils/sessionBranching.js'
-import { registerFilesystemAccessRoot } from '../services/filesystemAccessRoots.js'
+import { registerChangedFileAccessRoot, registerFilesystemAccessRoot } from '../services/filesystemAccessRoots.js'
+import { findGitRoot } from '../../utils/git.js'
+import { traceCaptureService, trimTraceCallPreviews } from '../services/traceCaptureService.js'
 
 const workspaceService = new WorkspaceService(
   async (sessionId) => (
@@ -108,6 +112,18 @@ export async function handleSessionsApi(
         )
       }
       return await getSessionMessages(sessionId)
+    }
+
+    if (subResource === 'trace') {
+      if (req.method !== 'GET') {
+        return Response.json(
+          { error: 'METHOD_NOT_ALLOWED', message: `Method ${req.method} not allowed` },
+          { status: 405 }
+        )
+      }
+      return segments[4] === 'calls'
+        ? await getSessionTraceCall(sessionId, segments[5])
+        : await getSessionTrace(sessionId)
     }
 
     if (subResource === 'git-info') {
@@ -248,6 +264,37 @@ async function getSessionMessages(sessionId: string): Promise<Response> {
     sessionService.getSessionTaskNotifications(sessionId),
   ])
   return Response.json({ messages, taskNotifications })
+}
+
+async function getSessionTrace(sessionId: string): Promise<Response> {
+  const [trace, session] = await Promise.all([
+    traceCaptureService.getSessionTrace(sessionId),
+    sessionService.getSession(sessionId).catch(() => null),
+  ])
+  return Response.json({
+    ...trace,
+    calls: trace.calls.map((call) => trimTraceCallPreviews(call)),
+    session: session
+      ? {
+          id: session.id,
+          title: session.title,
+          projectPath: session.projectPath,
+          workDir: session.workDir,
+        }
+      : null,
+  })
+}
+
+async function getSessionTraceCall(sessionId: string, callId: string | undefined): Promise<Response> {
+  if (!callId || callId.trim().length === 0) {
+    throw ApiError.badRequest('callId is required')
+  }
+
+  const call = await traceCaptureService.getSessionTraceCall(sessionId, callId)
+  if (!call) {
+    throw ApiError.notFound(`Trace call not found: ${callId}`)
+  }
+  return Response.json({ call })
 }
 
 async function handleSessionWorkspaceRoute(
@@ -665,6 +712,21 @@ async function getGitInfo(sessionId: string): Promise<Response> {
       }
     : null
 
+  // Fast check: if workDir is not inside a git repo, skip spawning git commands.
+  // findGitRoot uses fs.stat traversal with LRU cache (<5ms), avoiding 3 slow git
+  // spawns on non-git directories (each can take seconds as git searches upward).
+  const gitRoot = findGitRoot(workDir)
+  if (!gitRoot) {
+    const dirName = workDir.split('/').pop() || workDir.split(path.sep).pop() || ''
+    return Response.json({
+      branch: sessionBranch,
+      repoName: dirName,
+      workDir,
+      changedFiles: 0,
+      worktree,
+    })
+  }
+
   try {
     // Get branch name
     const branchProc = Bun.spawn(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], {
@@ -805,6 +867,14 @@ async function branchSession(req: Request, sessionId: string): Promise<Response>
 
 async function getTurnCheckpoints(sessionId: string): Promise<Response> {
   const checkpoints = await listSessionTurnCheckpoints(sessionId)
+  // Make this turn's real changed files previewable even when they live outside
+  // the session workdir (e.g. the user told the model to write to an absolute
+  // path on another drive). Writing them was authorized, so previewing is too.
+  for (const checkpoint of checkpoints) {
+    for (const filePath of checkpoint.code.filesChanged) {
+      registerChangedFileAccessRoot(filePath, checkpoint.workDir)
+    }
+  }
   return Response.json({ checkpoints })
 }
 
@@ -895,14 +965,14 @@ async function getRecentProjects(url: URL): Promise<Response> {
   const validSessions = sessions.filter((session) => session.workDirExists && session.workDir)
 
   // First pass: group by logical project root so worktrees stay under the same project.
+  // Optimization: prefer s.projectRoot (already resolved by listSessions) and only fall back
+  // to the expensive getSessionWorkDir (reads the full transcript) when projectRoot is absent.
   const realPathMap = new Map<string, { projectPath: string; modifiedAt: string; sessionCount: number; sessionId: string }>()
+  const fallbackSessionIds: string[] = []
   for (const s of validSessions) {
-    let realPath: string
-    try {
-      const workDir = await sessionService.getSessionWorkDir(s.id)
-      realPath = s.projectRoot || workDir || sessionService.desanitizePath(s.projectPath)
-    } catch {
-      realPath = s.projectRoot || sessionService.desanitizePath(s.projectPath)
+    const realPath = s.projectRoot || sessionService.desanitizePath(s.projectPath)
+    if (!s.projectRoot && s.id) {
+      fallbackSessionIds.push(s.id)
     }
 
     const existing = realPathMap.get(realPath)
@@ -918,7 +988,46 @@ async function getRecentProjects(url: URL): Promise<Response> {
     }
   }
 
+  // Resolve fallback sessions in parallel (only those missing projectRoot)
+  if (fallbackSessionIds.length > 0) {
+    const resolvedPaths = await Promise.all(
+      fallbackSessionIds.map(async (sessionId) => {
+        try {
+          const workDir = await sessionService.getSessionWorkDir(sessionId)
+          return { sessionId, workDir }
+        } catch {
+          return { sessionId, workDir: null as string | null }
+        }
+      }),
+    )
+    for (const { sessionId, workDir } of resolvedPaths) {
+      if (!workDir) continue
+      // Find the entry we already inserted with the desanitized projectPath
+      const session = validSessions.find((s) => s.id === sessionId)
+      const oldKey = session?.projectRoot || sessionService.desanitizePath(session?.projectPath || '')
+      const oldEntry = oldKey ? realPathMap.get(oldKey) : undefined
+      const newRealPath = workDir
+      if (oldKey && oldEntry && oldKey !== newRealPath) {
+        // Migrate entry to the resolved real path
+        realPathMap.delete(oldKey)
+        const existingNew = realPathMap.get(newRealPath)
+        if (!existingNew || oldEntry.modifiedAt > (existingNew?.modifiedAt ?? '')) {
+          realPathMap.set(newRealPath, {
+            projectPath: newRealPath,
+            modifiedAt: oldEntry.modifiedAt,
+            sessionCount: oldEntry.sessionCount + (existingNew?.sessionCount ?? 0),
+            sessionId: oldEntry.sessionId,
+          })
+        } else {
+          existingNew.sessionCount += oldEntry.sessionCount
+        }
+      }
+    }
+  }
+
   // Build project list with git info — parallelize git operations
+  // Optimization: use findGitRoot (fs.stat traversal + LRU cache, <5ms) to skip git spawns
+  // on non-git directories, avoiding slow git rev-parse on each (seconds per non-git dir).
   const entries = Array.from(realPathMap.entries())
   const projects = await Promise.all(
     entries.map(async ([realPath, info]) => {
@@ -927,15 +1036,11 @@ async function getRecentProjects(url: URL): Promise<Response> {
       let isGit = false
       let repoName: string | null = null
       let branch: string | null = null
-      try {
-        const proc = Bun.spawn(['git', 'rev-parse', '--is-inside-work-tree'], {
-          cwd: realPath, stdout: 'pipe', stderr: 'pipe',
-        })
-        const out = await new Response(proc.stdout).text()
-        isGit = out.trim() === 'true'
-
-        if (isGit) {
-          // Run branch + remote in parallel
+      const gitRoot = findGitRoot(realPath)
+      if (gitRoot) {
+        isGit = true
+        // Run branch + remote in parallel
+        try {
           const [branchResult, remoteResult] = await Promise.all([
             (async () => {
               const branchProc = Bun.spawn(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], {
@@ -956,8 +1061,9 @@ async function getRecentProjects(url: URL): Promise<Response> {
           ])
           branch = isDesktopWorktreeBranchName(branchResult) ? null : branchResult
           repoName = remoteResult
-        }
-      } catch { /* not a git repo or dir doesn't exist */ }
+        } catch { /* git command failed */ }
+      }
+      
 
       return {
         projectPath: info.projectPath, realPath, projectName, isGit, repoName, branch,

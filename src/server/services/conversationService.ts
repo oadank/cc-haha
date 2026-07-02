@@ -32,6 +32,7 @@ import { sanitizePath } from '../../utils/path.js'
 import { getProcessEnvWithTerminalShellEnvironment } from '../../utils/terminalShellEnvironment.js'
 import { attributionHeaderEnvForModel } from './attributionHeaderPolicy.js'
 import { buildNetworkEnvironment, loadNetworkSettings } from './networkSettings.js'
+import { readTraceCaptureSettings } from './traceCaptureService.js'
 import { logError } from '../../utils/log.js'
 import {
   createImageMetadataText,
@@ -44,6 +45,36 @@ const MAX_CAPTURED_SDK_SUMMARY = 20
 const CONTROL_READY_POLL_MS = 50
 const AUTO_MEMORY_DIRNAME = 'memory'
 export const DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 6_000
+
+/**
+ * Severity for a CLI subprocess exit, by exit code.
+ *
+ * Reaching handleProcessExit already means the process left outside the clean
+ * stop path, but the exit code still tells crash from teardown:
+ *  - 0            clean exit
+ *  - null         terminated by a signal with no numeric code
+ *  - 143 (SIGTERM), 137 (SIGKILL): killed — shutdown / user stop / OS reclaim
+ * None of these are a crash the user needs flagged in red. Any other non-zero
+ * code is a genuine "it died mid-chat" failure and stays an error.
+ */
+export function cliExitSeverity(code: number | null): 'info' | 'error' {
+  if (code === 0 || code === null || code === 143 || code === 137) return 'info'
+  return 'error'
+}
+
+export function buildConversationCliSpawnOptions(
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+) {
+  return {
+    cwd,
+    env,
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    windowsHide: true,
+  } as const
+}
 
 type AttachmentRef = {
   type: 'file' | 'image'
@@ -77,6 +108,8 @@ type SessionProcess = {
   outputDrain: Promise<void>
   sdkMessages: any[]
   initMessage: any | null
+  usesOfficialOAuth: boolean
+  officialOAuthToken: string | null
   pendingPermissionRequests: Map<
     string,
     {
@@ -103,6 +136,7 @@ type SessionStartOptions = {
   effort?: string
   thinking?: 'enabled' | 'adaptive' | 'disabled'
   providerId?: string | null
+  resumeInterruptedTurn?: boolean
 }
 
 export class ConversationStartupError extends Error {
@@ -261,16 +295,11 @@ export class ConversationService {
     // chdir 后落到正确目录。
     //
     const childEnv = await this.buildChildEnv(launchWorkDir, sdkUrl, options)
+    const usesOfficialOAuth = this.shouldMarkManagedOAuth(options?.providerId)
 
     let proc: ReturnType<typeof Bun.spawn>
     try {
-      proc = Bun.spawn(args, {
-        cwd: launchWorkDir,
-        env: childEnv,
-        stdin: 'pipe',
-        stdout: 'pipe',
-        stderr: 'pipe',
-      })
+      proc = Bun.spawn(args, buildConversationCliSpawnOptions(launchWorkDir, childEnv))
     } catch (spawnErr) {
       void diagnosticsService.recordEvent({
         type: 'cli_spawn_failed',
@@ -308,6 +337,8 @@ export class ConversationService {
       outputDrain: Promise.resolve(),
       sdkMessages: [],
       initMessage: null,
+      usesOfficialOAuth,
+      officialOAuthToken: childEnv.CLAUDE_CODE_OAUTH_TOKEN ?? null,
       pendingPermissionRequests: new Map(),
     }
     this.sessions.set(sessionId, session)
@@ -367,12 +398,21 @@ export class ConversationService {
 
     session.startupPending = false
 
-    if (shouldReplacePlaceholder || !launchInfo) {
+    const shouldPersistRuntimeMetadata =
+      options?.providerId !== undefined ||
+      !!options?.model ||
+      !!options?.effort
+    if (shouldReplacePlaceholder || !launchInfo || shouldPersistRuntimeMetadata) {
       await sessionService.appendSessionMetadata(sessionId, {
         workDir: launchWorkDir,
         customTitle: launchInfo?.customTitle ?? null,
         repository: launchRepository,
         permissionMode: options?.permissionMode || launchInfo?.permissionMode,
+        ...(options?.providerId !== undefined
+          ? { runtimeProviderId: options.providerId }
+          : {}),
+        ...(options?.model ? { runtimeModelId: options.model } : {}),
+        ...(options?.effort ? { effortLevel: options.effort } : {}),
       })
     }
 
@@ -412,6 +452,10 @@ export class ConversationService {
     content: string,
     attachments?: AttachmentRef[],
   ): Promise<boolean> {
+    const session = this.sessions.get(sessionId)
+    if (session) {
+      await this.refreshOfficialOAuthTokenBeforeTurn(sessionId, session)
+    }
     const userContent = await this.buildUserContent(content, sessionId, attachments)
     return this.sendSdkMessage(sessionId, {
       type: 'user',
@@ -430,6 +474,8 @@ export class ConversationService {
     allowed: boolean,
     rule?: string,
     updatedInput?: Record<string, unknown>,
+    denyMessage?: string,
+    permissionUpdates?: unknown[],
   ): boolean {
     const session = this.sessions.get(sessionId)
     const pendingRequest = session?.pendingPermissionRequests.get(requestId)
@@ -446,7 +492,9 @@ export class ConversationService {
           ? {
               behavior: 'allow',
               updatedInput: updatedInput ?? {},
-              ...(rule === 'always' && pendingRequest
+              ...(Array.isArray(permissionUpdates) && permissionUpdates.length > 0
+                ? { updatedPermissions: permissionUpdates }
+                : rule === 'always' && pendingRequest
                 ? {
                     updatedPermissions: [
                       ...normalizeSessionPermissionUpdates(
@@ -457,7 +505,7 @@ export class ConversationService {
                   }
                 : {}),
             }
-          : { behavior: 'deny', message: 'User denied via UI' },
+          : { behavior: 'deny', message: denyMessage || 'User denied via UI' },
       },
     })
   }
@@ -924,7 +972,7 @@ export class ConversationService {
       const exitError = this.buildRuntimeExitMessage(sessionId, code)
       void diagnosticsService.recordEvent({
         type: 'cli_runtime_exit',
-        severity: 'error',
+        severity: cliExitSeverity(code),
         sessionId,
         summary: exitError,
         details: {
@@ -1000,6 +1048,7 @@ export class ConversationService {
       'ANTHROPIC_API_KEY',
       'ANTHROPIC_BASE_URL',
       'ANTHROPIC_AUTH_TOKEN',
+      'ENABLE_TOOL_SEARCH',
       'ANTHROPIC_MODEL',
       'ANTHROPIC_DEFAULT_HAIKU_MODEL',
       'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
@@ -1017,6 +1066,12 @@ export class ConversationService {
 
     const cleanEnv = await getProcessEnvWithTerminalShellEnvironment()
     delete cleanEnv.CLAUDE_CODE_OAUTH_TOKEN
+    if (options?.resumeInterruptedTurn === false) {
+      delete cleanEnv.CLAUDE_CODE_RESUME_INTERRUPTED_TURN
+    }
+    delete cleanEnv.CC_HAHA_TRACE_PROVIDER_ID
+    delete cleanEnv.CC_HAHA_TRACE_PROVIDER_NAME
+    delete cleanEnv.CC_HAHA_TRACE_PROVIDER_FORMAT
     if (this.shouldStripInheritedProviderEnv(options?.providerId)) {
       for (const key of PROVIDER_ENV_KEYS) {
         delete cleanEnv[key]
@@ -1033,11 +1088,15 @@ export class ConversationService {
       }
     }
 
-    const explicitProviderEnv =
+    const explicitProvider =
       typeof options?.providerId === 'string'
-        ? await this.providerService.getProviderRuntimeEnv(options.providerId)
+        ? await this.providerService.getProvider(options.providerId)
         : null
-    const networkEnv = buildNetworkEnvironment(await loadNetworkSettings())
+    const explicitProviderEnv = explicitProvider
+      ? await this.providerService.getProviderRuntimeEnv(explicitProvider.id)
+      : null
+    const networkEnv = buildNetworkEnvironment(await loadNetworkSettings(), cleanEnv)
+    const traceCaptureEnabled = (await readTraceCaptureSettings()).enabled
     if (explicitProviderEnv && options?.model?.trim()) {
       explicitProviderEnv.ANTHROPIC_MODEL = options.model.trim()
     }
@@ -1060,12 +1119,50 @@ export class ConversationService {
       CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING: '1',
       // Desktop must fail stuck provider streams instead of leaving the UI running forever.
       CLAUDE_ENABLE_STREAM_WATCHDOG: cleanEnv.CLAUDE_ENABLE_STREAM_WATCHDOG || '1',
+      // Third-party providers can stay silent for minutes mid-stream (thinking
+      // phases emit no SSE bytes, and many gateways never send pings), so the
+      // CLI's 90s idle default kills healthy streams (#766). 240s still frees
+      // a truly dead connection without shooting slow ones.
+      CLAUDE_STREAM_IDLE_TIMEOUT_MS: cleanEnv.CLAUDE_STREAM_IDLE_TIMEOUT_MS || '240000',
+      // Overall wall-clock cap for one streaming response, NOT reset by chunks.
+      // The 240s idle timer above is reset by every SSE event, so an upstream
+      // that trickles content deltas (e.g. a huge tool_use input_json_delta)
+      // just under 240s apart keeps it alive forever and the request hangs with
+      // no completion (#766: "卡住" with slowly growing tokens). This independent
+      // cap frees such a stream after a fixed duration regardless of trickle.
+      CLAUDE_STREAM_MAX_DURATION_MS: cleanEnv.CLAUDE_STREAM_MAX_DURATION_MS || '600000',
+      // Time-to-first-token budget: how long to wait for the FIRST streamed
+      // chunk after response headers arrive. The idle timer above is the wrong
+      // knob for slow prefill — it kills healthy local/3P models that take
+      // minutes to emit their first token (#826). Tie this to the user's
+      // request-timeout setting (API_TIMEOUT_MS, from networkEnv) so raising
+      // "请求超时" actually extends how long we wait for the first token. The
+      // CLI switches to the shorter idle budget once tokens start flowing.
+      CLAUDE_STREAM_FIRST_TOKEN_TIMEOUT_MS:
+        cleanEnv.CLAUDE_STREAM_FIRST_TOKEN_TIMEOUT_MS || networkEnv.API_TIMEOUT_MS,
+      // When a stream does get aborted, retry as streaming instead of falling
+      // back to non-streaming: a non-streaming request must wait for the FULL
+      // generation before the first response byte, so slow providers can never
+      // finish inside API_TIMEOUT_MS — the fallback loops 5-minute aborts
+      // forever while the UI shows "running" (#766). It can also double-run
+      // tools (upstream inc-4258).
+      CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: cleanEnv.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK || '1',
       CLAUDE_CODE_DIAGNOSTICS_FILE: cliDiagnosticsPath,
       CLAUDE_COWORK_MEMORY_PATH_OVERRIDE: this.resolveDesktopAutoMemoryPath(workDir),
       CALLER_DIR: workDir,
       PWD: workDir,
       ...(sdkUrl
         ? { CC_HAHA_COMPUTER_USE_HOST_BUNDLE_ID: 'com.claude-code-haha.desktop' }
+        : {}),
+      ...(sdkUrl && traceCaptureEnabled
+        ? { CC_HAHA_TRACE_API_CALLS: '1' }
+        : {}),
+      ...(sdkUrl && traceCaptureEnabled && explicitProvider
+        ? {
+            CC_HAHA_TRACE_PROVIDER_ID: explicitProvider.id,
+            CC_HAHA_TRACE_PROVIDER_NAME: explicitProvider.name,
+            CC_HAHA_TRACE_PROVIDER_FORMAT: explicitProvider.apiFormat ?? 'anthropic',
+          }
         : {}),
       ...(desktopServerUrl
         ? { CC_HAHA_DESKTOP_SERVER_URL: desktopServerUrl }
@@ -1139,6 +1236,33 @@ export class ConversationService {
     return env
   }
 
+  private async refreshOfficialOAuthTokenBeforeTurn(
+    sessionId: string,
+    session: SessionProcess,
+  ): Promise<void> {
+    if (!session.usesOfficialOAuth) return
+
+    let token: string | null = null
+    try {
+      const { hahaOAuthService } = await import('./hahaOAuthService.js')
+      token = await hahaOAuthService.ensureFreshAccessToken()
+    } catch (err) {
+      console.error(
+        '[conversationService] refresh official OAuth token before turn failed:',
+        err instanceof Error ? err.message : err,
+      )
+      return
+    }
+
+    if (!token || token === session.officialOAuthToken) return
+
+    session.officialOAuthToken = token
+    this.sendSdkMessage(sessionId, {
+      type: 'update_environment_variables',
+      variables: { CLAUDE_CODE_OAUTH_TOKEN: token },
+    })
+  }
+
   private shouldStripInheritedProviderEnv(providerId?: string | null): boolean {
     if (providerId !== undefined) {
       return true
@@ -1162,6 +1286,7 @@ export class ConversationService {
         'ANTHROPIC_API_KEY',
         'ANTHROPIC_BASE_URL',
         'ANTHROPIC_AUTH_TOKEN',
+        'ENABLE_TOOL_SEARCH',
         'ANTHROPIC_MODEL',
         'ANTHROPIC_DEFAULT_HAIKU_MODEL',
         'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',

@@ -126,9 +126,11 @@ vi.mock('./cliTaskStore', () => ({
 }))
 
 import { sessionsApi } from '../api/sessions'
+import { useSettingsStore } from './settingsStore'
 import {
   mapHistoryMessagesToUiMessages,
   reconstructAgentNotifications,
+  stripGeneratedImageMetadataLines,
   type PerSessionState,
   useChatStore,
 } from './chatStore'
@@ -151,6 +153,7 @@ function makeSession(overrides: Partial<PerSessionState> = {}): PerSessionState 
     pendingPermission: null,
     pendingComputerUsePermission: null,
     tokenUsage: { input_tokens: 0, output_tokens: 0 },
+    streamingResponseChars: 0,
     elapsedSeconds: 0,
     statusVerb: '',
     apiRetry: null,
@@ -161,6 +164,101 @@ function makeSession(overrides: Partial<PerSessionState> = {}): PerSessionState 
     ...overrides,
   }
 }
+
+describe('stripGeneratedImageMetadataLines', () => {
+  it('removes simple, detailed, and resize metadata lines but keeps the prompt body', () => {
+    const text = [
+      'first line of the prompt',
+      'second line',
+      '[Image source: C:\\Users\\Relakkes\\.claude\\uploads\\sid\\a.png]',
+      '[Image: source: /Users/me/.claude/uploads/sid/b.png, original 1024x768, displayed at 512x384. Multiply coordinates by 2 to map to original image.]',
+      '[Image: original 800x600, displayed at 400x300. Multiply coordinates by 2 to map to original image.]',
+    ].join('\n')
+    expect(stripGeneratedImageMetadataLines(text)).toBe('first line of the prompt\nsecond line')
+  })
+
+  it('normalizes CRLF and leaves metadata-free text untouched', () => {
+    expect(stripGeneratedImageMetadataLines('a\r\nb\r\n')).toBe('a\nb')
+    expect(stripGeneratedImageMetadataLines('just a normal prompt')).toBe('just a normal prompt')
+  })
+
+  it('returns empty string when the text is only metadata', () => {
+    expect(stripGeneratedImageMetadataLines('[Image source: /tmp/x.png]')).toBe('')
+  })
+})
+
+describe('chatStore tool settlement', () => {
+  beforeEach(() => {
+    sendMock.mockReset()
+    updateTabStatusMock.mockReset()
+    notifyDesktopMock.mockReset()
+    localStorage.clear()
+    useSettingsStore.setState({ locale: 'en' })
+    useChatStore.setState({
+      ...initialState,
+      sessions: {
+        [TEST_SESSION_ID]: makeSession(),
+      },
+    })
+  })
+
+  it('marks sibling pending tool calls stopped when a parallel tool result fails and the turn completes', () => {
+    const store = useChatStore.getState()
+
+    store.handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_start',
+      blockType: 'tool_use',
+      toolName: 'Grep',
+      toolUseId: 'grep-1',
+    })
+    store.handleServerMessage(TEST_SESSION_ID, {
+      type: 'tool_use_complete',
+      toolName: 'Grep',
+      toolUseId: 'grep-1',
+      input: { pattern: 'needle' },
+    })
+    store.handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_start',
+      blockType: 'tool_use',
+      toolName: 'Read',
+      toolUseId: 'read-1',
+    })
+    store.handleServerMessage(TEST_SESSION_ID, {
+      type: 'tool_use_complete',
+      toolName: 'Read',
+      toolUseId: 'read-1',
+      input: { file_path: '/missing.md' },
+    })
+    store.handleServerMessage(TEST_SESSION_ID, {
+      type: 'tool_result',
+      toolUseId: 'read-1',
+      content: 'File does not exist',
+      isError: true,
+    })
+    store.handleServerMessage(TEST_SESSION_ID, {
+      type: 'message_complete',
+      usage: { input_tokens: 1, output_tokens: 0 },
+    })
+
+    const session = useChatStore.getState().sessions[TEST_SESSION_ID]
+    expect(session).toBeTruthy()
+    if (!session) return
+    const grep = session.messages.find((message) =>
+      message.type === 'tool_use' && message.toolUseId === 'grep-1',
+    )
+    const read = session.messages.find((message) =>
+      message.type === 'tool_use' && message.toolUseId === 'read-1',
+    )
+
+    expect(read).toMatchObject({ type: 'tool_use', isPending: false })
+    expect(grep).toMatchObject({
+      type: 'tool_use',
+      isPending: false,
+      status: 'stopped',
+    })
+    expect(session.chatState).toBe('idle')
+  })
+})
 
 describe('chatStore history mapping', () => {
   beforeEach(() => {
@@ -185,10 +283,45 @@ describe('chatStore history mapping', () => {
     cliTaskStoreSnapshot.sessionId = null
     useSessionRuntimeStore.setState({ selections: {} })
     localStorage.clear()
+    useSettingsStore.setState({ locale: 'en' })
     useChatStore.setState({
       ...initialState,
       sessions: {},
     })
+  })
+
+  it('does not prewarm an existing transcript when opening it for history review', () => {
+    sessionStoreSnapshot.sessions = [{
+      id: TEST_SESSION_ID,
+      title: 'Existing transcript',
+      createdAt: '2026-06-20T10:00:00.000Z',
+      modifiedAt: '2026-06-20T10:30:00.000Z',
+      messageCount: 4,
+      projectPath: '/workspace/project',
+      workDir: '/workspace/project',
+      workDirExists: true,
+    }]
+
+    useChatStore.getState().connectToSession(TEST_SESSION_ID)
+
+    expect(sendMock).not.toHaveBeenCalledWith(TEST_SESSION_ID, { type: 'prewarm_session' })
+  })
+
+  it('still prewarms empty placeholder sessions so new chats start quickly', () => {
+    sessionStoreSnapshot.sessions = [{
+      id: TEST_SESSION_ID,
+      title: 'New Session',
+      createdAt: '2026-06-20T10:00:00.000Z',
+      modifiedAt: '2026-06-20T10:00:00.000Z',
+      messageCount: 0,
+      projectPath: '/workspace/project',
+      workDir: '/workspace/project',
+      workDirExists: true,
+    }]
+
+    useChatStore.getState().connectToSession(TEST_SESSION_ID)
+
+    expect(sendMock).toHaveBeenCalledWith(TEST_SESSION_ID, { type: 'prewarm_session' })
   })
 
   it('preserves thinking blocks when restoring transcript history', () => {
@@ -439,6 +572,228 @@ describe('chatStore history mapping', () => {
     ])
   })
 
+  it('does not restore internal slash-command breadcrumbs as user history bubbles', () => {
+    const messages: MessageEntry[] = [
+      {
+        id: 'agent-command-string',
+        type: 'user',
+        timestamp: '2026-06-15T03:32:13.000Z',
+        content: [
+          '<command-message>agent</command-message>',
+          '<command-name>/agent</command-name>',
+          '<command-args>Plan 222</command-args>',
+        ].join('\n'),
+      },
+      {
+        id: 'agent-command-array',
+        type: 'user',
+        timestamp: '2026-06-15T03:32:14.000Z',
+        content: [
+          {
+            type: 'text',
+            text: [
+              '<command-message>agent</command-message>',
+              '<command-name>/agent</command-name>',
+              '<command-args>Plan 333</command-args>',
+            ].join('\n'),
+          },
+        ],
+      },
+      {
+        id: 'transcript-user-1',
+        type: 'user',
+        timestamp: '2026-06-15T03:32:15.000Z',
+        content: '继续处理这个问题',
+      },
+    ]
+
+    expect(mapHistoryMessagesToUiMessages(messages)).toMatchObject([
+      {
+        id: 'transcript-user-1',
+        type: 'user_text',
+        content: '继续处理这个问题',
+      },
+    ])
+  })
+
+  it('restores persisted image user messages as renderable attachments without exposing image metadata text', () => {
+    const messages: MessageEntry[] = [
+      {
+        id: 'image-user-1',
+        type: 'user',
+        timestamp: '2026-06-04T08:07:15.803Z',
+        content: [
+          { type: 'text', text: '解释一下这张图片讲了什么东西' },
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/jpeg',
+              data: 'JPEGBASE64',
+            },
+          },
+          {
+            type: 'text',
+            text: '[Image source: /Users/test/.claude/uploads/session-1/pasted-image.jpeg]',
+          },
+        ],
+      },
+    ]
+
+    const mapped = mapHistoryMessagesToUiMessages(messages)
+
+    expect(mapped).toMatchObject([
+      {
+        id: 'image-user-1',
+        type: 'user_text',
+        content: '解释一下这张图片讲了什么东西',
+        modelContent: [
+          '解释一下这张图片讲了什么东西',
+          '[Image source: /Users/test/.claude/uploads/session-1/pasted-image.jpeg]',
+        ].join('\n'),
+        attachments: [{
+          type: 'image',
+          name: 'pasted-image.jpeg',
+          path: '/Users/test/.claude/uploads/session-1/pasted-image.jpeg',
+          data: 'data:image/jpeg;base64,JPEGBASE64',
+          mimeType: 'image/jpeg',
+        }],
+      },
+    ])
+  })
+
+  it('restores multiple persisted images with their matching source paths in order', () => {
+    const mapped = mapHistoryMessagesToUiMessages([
+      {
+        id: 'multi-image-user-1',
+        type: 'user',
+        timestamp: '2026-06-04T08:07:15.803Z',
+        content: [
+          { type: 'text', text: '对比这两张图' },
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/jpeg',
+              data: 'FIRSTJPEG',
+            },
+          },
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/png',
+              data: 'SECONDPNG',
+            },
+          },
+          {
+            type: 'text',
+            text: '[Image source: /Users/test/.claude/uploads/session-1/first-pasted-image.jpeg]',
+          },
+          {
+            type: 'text',
+            text: '[Image source: /Users/test/.claude/uploads/session-1/second-pasted-image.png]',
+          },
+        ],
+      },
+    ])
+
+    expect(mapped).toMatchObject([
+      {
+        id: 'multi-image-user-1',
+        type: 'user_text',
+        content: '对比这两张图',
+        attachments: [
+          {
+            type: 'image',
+            name: 'first-pasted-image.jpeg',
+            path: '/Users/test/.claude/uploads/session-1/first-pasted-image.jpeg',
+            data: 'data:image/jpeg;base64,FIRSTJPEG',
+            mimeType: 'image/jpeg',
+          },
+          {
+            type: 'image',
+            name: 'second-pasted-image.png',
+            path: '/Users/test/.claude/uploads/session-1/second-pasted-image.png',
+            data: 'data:image/png;base64,SECONDPNG',
+            mimeType: 'image/png',
+          },
+        ],
+      },
+    ])
+  })
+
+  it('keeps image-looking text visible when history has no image block', () => {
+    const mapped = mapHistoryMessagesToUiMessages([
+      {
+        id: 'plain-text-user-1',
+        type: 'user',
+        timestamp: '2026-06-04T08:07:15.803Z',
+        content: [
+          { type: 'text', text: '[Image source: /tmp/example.png]' },
+        ],
+      },
+    ])
+
+    expect(mapped).toMatchObject([
+      {
+        id: 'plain-text-user-1',
+        type: 'user_text',
+        content: '[Image source: /tmp/example.png]',
+      },
+    ])
+  })
+
+  it('restores visual selection history as annotated screenshot attachment without exposing model prompt', () => {
+    const modelPrompt = [
+      '请根据截图中编号 1 的蓝色标注修改本地前端。',
+      '目标元素：<time>',
+      'Selector：#root > main > section > ol > li:nth-of-type(1) > article > div:nth-of-type(1) > time',
+      'DOM 路径：body:nth-child(2) > div:nth-child(1) > main:nth-child(1) > section:nth-child(1) > ol:nth-child(4) > li:nth-child(1) > article:nth-child(1) > div:nth-child(3) > time:nth-child(2)',
+      '页面标题：Todo Desk Board',
+      '页面 URL：http://127.0.0.1:47931/',
+      '当前文本：06/10 21:12',
+      '用户注释：',
+      '这里的时间加上年份',
+      '请优先依据截图里的编号标注定位元素，selector 只作为辅助线索。',
+    ].join('\n')
+
+    const mapped = mapHistoryMessagesToUiMessages([
+      {
+        id: 'selection-user-1',
+        type: 'user',
+        timestamp: '2026-06-10T16:20:00.000Z',
+        content: [
+          { type: 'text', text: modelPrompt },
+          {
+            type: 'image',
+            source: {
+              media_type: 'image/png',
+              data: 'SELECTIONPNG',
+            },
+          },
+        ],
+      } as MessageEntry,
+    ])
+
+    expect(mapped).toMatchObject([
+      {
+        id: 'selection-user-1',
+        type: 'user_text',
+        content: '',
+        modelContent: modelPrompt,
+        attachments: [{
+          type: 'image',
+          name: '<time>',
+          data: 'data:image/png;base64,SELECTIONPNG',
+          mimeType: 'image/png',
+          note: '这里的时间加上年份',
+          quote: '#root > main > section > ol > li:nth-of-type(1) > article > div:nth-of-type(1) > time',
+        }],
+      },
+    ])
+  })
+
   it('restores /goal local command output from transcript history', () => {
     const messages: MessageEntry[] = [
       {
@@ -503,6 +858,27 @@ describe('chatStore history mapping', () => {
     ])
   })
 
+  it('restores /goal continuation markers from transcript history', () => {
+    const messages: MessageEntry[] = [
+      {
+        id: 'goal-continuing',
+        type: 'system',
+        timestamp: '2026-04-06T00:00:02.000Z',
+        content: '<local-command-stdout>Goal continuing: verify the release path</local-command-stdout>',
+      },
+    ]
+
+    expect(mapHistoryMessagesToUiMessages(messages)).toMatchObject([
+      {
+        id: 'goal-continuing',
+        type: 'goal_event',
+        action: 'status',
+        status: 'continuing',
+        message: 'Goal continuing: verify the release path',
+      },
+    ])
+  })
+
   it('restores completed /goal state from transcript history after app restart', async () => {
     vi.mocked(sessionsApi.getMessages).mockResolvedValueOnce({
       messages: [
@@ -558,6 +934,49 @@ describe('chatStore history mapping', () => {
       action: 'completed',
       status: 'complete',
       objective: 'ship the smoke test',
+    })
+  })
+
+  it('restores token usage from transcript history after reopening a session', async () => {
+    vi.mocked(sessionsApi.getMessages).mockResolvedValueOnce({
+      messages: [
+        {
+          id: 'user-1',
+          type: 'user',
+          timestamp: '2026-04-06T00:00:00.000Z',
+          content: 'build the docs',
+        },
+        {
+          id: 'assistant-1',
+          type: 'assistant',
+          timestamp: '2026-04-06T00:00:01.000Z',
+          content: 'done',
+          usage: { input_tokens: 1200, output_tokens: 80 },
+        },
+        {
+          id: 'assistant-2',
+          type: 'assistant',
+          timestamp: '2026-04-06T00:00:02.000Z',
+          content: [{ type: 'text', text: 'follow-up done' }],
+          usage: { input_tokens: 3400, output_tokens: 120 },
+        },
+      ],
+    })
+
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [],
+          tokenUsage: { input_tokens: 0, output_tokens: 0 },
+        }),
+      },
+    })
+
+    await useChatStore.getState().loadHistory(TEST_SESSION_ID)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.tokenUsage).toEqual({
+      input_tokens: 4600,
+      output_tokens: 200,
     })
   })
 
@@ -1114,6 +1533,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -1183,6 +1603,56 @@ describe('chatStore history mapping', () => {
     )
   })
 
+  it('keeps queued message model context when editing the visible prompt text', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'streaming',
+        }),
+      },
+    })
+
+    const id = useChatStore.getState().queueUserMessage(TEST_SESSION_ID, {
+      content: 'Referenced workspace context:\n@"src/App.tsx:L4":\n```tsx\nconst value = 1\n```\n\nfix this',
+      attachments: [{
+        type: 'file',
+        name: 'App.tsx',
+        path: '/repo/src/App.tsx',
+        lineStart: 4,
+        lineEnd: 4,
+      }],
+      displayContent: 'fix this',
+      displayAttachments: [{
+        type: 'file',
+        name: 'App.tsx',
+        path: 'src/App.tsx',
+        lineStart: 4,
+        lineEnd: 4,
+      }],
+    })
+
+    useChatStore.getState().updateQueuedUserMessage(TEST_SESSION_ID, id, 'tighten this')
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.queuedUserMessages?.[0]).toMatchObject({
+      displayContent: 'tighten this',
+      content: 'Referenced workspace context:\n@"src/App.tsx:L4":\n```tsx\nconst value = 1\n```\n\ntighten this',
+    })
+
+    useChatStore.getState().sendQueuedUserMessage(TEST_SESSION_ID, id)
+
+    expect(sendMock).toHaveBeenCalledWith(TEST_SESSION_ID, {
+      type: 'user_message',
+      content: 'Referenced workspace context:\n@"src/App.tsx:L4":\n```tsx\nconst value = 1\n```\n\ntighten this',
+      attachments: [{
+        type: 'file',
+        name: 'App.tsx',
+        path: '/repo/src/App.tsx',
+        lineStart: 4,
+        lineEnd: 4,
+      }],
+    })
+  })
+
   it('can send a visual selection turn without rendering the full model prompt as user text', () => {
     useChatStore.setState({
       sessions: {
@@ -1198,6 +1668,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -1274,6 +1745,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -1441,6 +1913,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [{ name: 'old-command', description: 'Old command' }],
@@ -1640,6 +2113,45 @@ describe('chatStore history mapping', () => {
     vi.useRealTimers()
   })
 
+  it('marks pending tool input as stopped when generation is stopped', () => {
+    vi.useFakeTimers()
+
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({ chatState: 'tool_executing' }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_start',
+      blockType: 'tool_use',
+      toolName: 'Write',
+      toolUseId: 'write-1',
+    })
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_delta',
+      toolInput: '{"file_path":"/private/tmp/story.md","content":"第一章',
+    })
+    vi.advanceTimersByTime(60)
+
+    useChatStore.getState().stopGeneration(TEST_SESSION_ID)
+
+    const session = useChatStore.getState().sessions[TEST_SESSION_ID]
+    expect(session?.chatState).toBe('idle')
+    expect(session?.activeToolUseId).toBeNull()
+    expect(session?.activeToolName).toBeNull()
+    expect(session?.streamingToolInput).toBe('')
+    expect(session?.messages[0]).toMatchObject({
+      type: 'tool_use',
+      toolUseId: 'write-1',
+      isPending: false,
+      status: 'stopped',
+    })
+
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+  })
+
   it('refreshes merged slash commands when a live CLI update omits project commands', async () => {
     const cliCommand = { name: 'builtin-help', description: 'Built-in command' }
     const projectCommand = { name: 'project-probe', description: 'Project custom command' }
@@ -1814,6 +2326,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -1877,6 +2390,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -1894,6 +2408,35 @@ describe('chatStore history mapping', () => {
     expect(updateSessionPermissionModeMock).toHaveBeenCalledWith('session-1', 'acceptEdits')
   })
 
+  it('mirrors CLI permission-mode broadcasts locally without echoing back to the server', () => {
+    sendMock.mockReset()
+    updateSessionPermissionModeMock.mockReset()
+
+    // CLI 退出 plan 后恢复到 bypassPermissions，回传 permission_mode_changed。
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'permission_mode_changed',
+      mode: 'bypassPermissions',
+    })
+
+    // 本地镜像被校正……
+    expect(updateSessionPermissionModeMock).toHaveBeenCalledWith(TEST_SESSION_ID, 'bypassPermissions')
+    // ……但绝不能再 set_permission_mode 回发给 CLI，否则形成回环。
+    expect(sendMock).not.toHaveBeenCalled()
+  })
+
+  it('ignores permission-mode broadcasts for modes the selector cannot render', () => {
+    updateSessionPermissionModeMock.mockReset()
+
+    // 'auto' 不在桌面端 PermissionMode 内（仅在 CLI 启用对应特性时存在），
+    // 直接忽略，避免选择器拿到无法渲染的值。
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'permission_mode_changed',
+      mode: 'auto' as never,
+    })
+
+    expect(updateSessionPermissionModeMock).not.toHaveBeenCalled()
+  })
+
   it('stores terminal task notifications for agent tool cards', () => {
     useChatStore.setState({
       sessions: {
@@ -1909,6 +2452,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2049,7 +2593,105 @@ describe('chatStore history mapping', () => {
       outputFile: '/tmp/agent-output.txt',
     })
     expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages).toHaveLength(0)
+
+    vi.setSystemTime(new Date('2026-04-06T00:00:05.000Z'))
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'system_notification',
+      subtype: 'task_progress',
+      data: {
+        task_id: 'agent-task-1',
+        tool_use_id: 'agent-tool-1',
+        status: 'running',
+        summary: 'Resumed review',
+      },
+    })
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.backgroundAgentTasks?.['agent-task-1']).toMatchObject({
+      status: 'running',
+      startedAt: new Date('2026-04-06T00:00:05.000Z').getTime(),
+      summary: 'Resumed review',
+    })
+
+    vi.setSystemTime(new Date('2026-04-06T00:00:06.000Z'))
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'system_notification',
+      subtype: 'task_notification',
+      data: {
+        task_id: 'agent-task-1',
+        tool_use_id: 'agent-tool-1',
+        status: 'completed',
+        summary: 'Second lifecycle complete.',
+      },
+    })
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.backgroundAgentTasks?.['agent-task-1']).toMatchObject({
+      status: 'completed',
+      startedAt: new Date('2026-04-06T00:00:05.000Z').getTime(),
+      summary: 'Second lifecycle complete.',
+    })
+
+    vi.setSystemTime(new Date('2026-04-06T00:00:07.000Z'))
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'system_notification',
+      subtype: 'task_notification',
+      data: {
+        task_id: 'agent-task-1',
+        tool_use_id: 'agent-tool-1',
+        status: 'completed',
+        summary: 'Third lifecycle complete without progress.',
+        result: 'The resumed agent finished without using another tool.',
+      },
+    })
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.backgroundAgentTasks?.['agent-task-1']).toMatchObject({
+      status: 'completed',
+      startedAt: new Date('2026-04-06T00:00:07.000Z').getTime(),
+      summary: 'Third lifecycle complete without progress.',
+      result: 'The resumed agent finished without using another tool.',
+    })
     vi.useRealTimers()
+  })
+
+  it('keeps idle chat state while marking the tab running for background task start and progress', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'idle',
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'system_notification',
+      subtype: 'task_started',
+      data: {
+        task_id: 'agent-task-1',
+        tool_use_id: 'agent-tool-1',
+        description: 'Verify the todo app',
+        task_type: 'local_agent',
+      },
+    })
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.chatState).toBe('idle')
+    expect(updateTabStatusMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, 'running')
+
+    updateTabStatusMock.mockClear()
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'system_notification',
+      subtype: 'task_progress',
+      data: {
+        task_id: 'agent-task-1',
+        tool_use_id: 'agent-tool-1',
+        summary: 'Still reviewing',
+      },
+    })
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.chatState).toBe('idle')
+    expect(updateTabStatusMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, 'running')
   })
 
   it('keeps non-agent background tasks visible and updates the existing transcript card', () => {
@@ -2230,6 +2872,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 12, output_tokens: 34 },
+          streamingResponseChars: 999,
           elapsedSeconds: 5,
           statusVerb: 'Thinking',
           slashCommands: [],
@@ -2254,6 +2897,7 @@ describe('chatStore history mapping', () => {
     expect(session?.streamingText).toBe('')
     expect(session?.chatState).toBe('idle')
     expect(session?.tokenUsage).toEqual({ input_tokens: 0, output_tokens: 0 })
+    expect(session?.streamingResponseChars).toBe(0)
     expect(session?.slashCommands).toEqual([])
     expect(clearTasksMock).toHaveBeenCalledWith(TEST_SESSION_ID)
 
@@ -2303,6 +2947,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2331,6 +2976,19 @@ describe('chatStore history mapping', () => {
         preTokens: 120000,
       },
     ])
+    // The context usage indicator watches this counter to force an
+    // immediate post-compact refresh (#743). The seeded session state above
+    // intentionally lacks compactCount (legacy persisted shape) — the bump
+    // must tolerate that.
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.compactCount).toBe(1)
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'system_notification',
+      subtype: 'compact_boundary',
+      message: 'Context compacted',
+      data: { trigger: 'manual' },
+    })
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.compactCount).toBe(2)
   })
 
   it('attaches compact summary content to the latest compact card', () => {
@@ -2348,6 +3006,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: 'Compacting conversation',
           slashCommands: [],
@@ -2402,6 +3061,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2450,6 +3110,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2530,6 +3191,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2561,6 +3223,327 @@ describe('chatStore history mapping', () => {
     ])
     expect(session?.messages.some((message) => message.type === 'compact_summary' && message.phase === 'compacting')).toBe(false)
     expect(updateTabStatusMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, 'running')
+  })
+
+  it('starts an elapsed timer when a reconnected session reports running status', () => {
+    vi.useFakeTimers()
+
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'idle',
+          elapsedSeconds: 0,
+          elapsedTimer: null,
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'status',
+      state: 'thinking',
+      verb: 'Thinking',
+    })
+
+    vi.advanceTimersByTime(2100)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.elapsedSeconds).toBe(2)
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'status',
+      state: 'idle',
+    })
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.elapsedTimer).toBeNull()
+
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+  })
+
+  it('resumes the elapsed timer when streaming continues after the timer was lost', () => {
+    vi.useFakeTimers()
+
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'streaming',
+          elapsedSeconds: 3,
+          elapsedTimer: null,
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_delta',
+      text: 'still running',
+    })
+
+    vi.advanceTimersByTime(2100)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.elapsedSeconds).toBe(5)
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'status',
+      state: 'idle',
+    })
+
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+  })
+
+  it('adds a completed turn duration after a running response finishes', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'streaming',
+          elapsedSeconds: 65,
+          streamingText: 'Finished answer',
+          elapsedTimer: null,
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'message_complete',
+      usage: { input_tokens: 12, output_tokens: 34 },
+    })
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages).toMatchObject([
+      {
+        type: 'assistant_text',
+        content: 'Finished answer',
+      },
+      {
+        type: 'system',
+        content: 'Completed in 1m 5s',
+      },
+    ])
+  })
+
+  it('localizes completed turn duration units', () => {
+    useSettingsStore.setState({ locale: 'zh' })
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'streaming',
+          elapsedSeconds: 65,
+          streamingText: 'Finished answer',
+          elapsedTimer: null,
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'message_complete',
+      usage: { input_tokens: 12, output_tokens: 34 },
+    })
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages).toMatchObject([
+      {
+        type: 'assistant_text',
+        content: 'Finished answer',
+      },
+      {
+        type: 'system',
+        content: '已完成，用时 1 分 5 秒',
+      },
+    ])
+  })
+
+  it('keeps background agent sessions visibly running when the foreground turn completes', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'streaming',
+          elapsedSeconds: 65,
+          streamingText: 'Finished answer',
+          elapsedTimer: null,
+          backgroundAgentTasks: {
+            'agent-task-1': {
+              taskId: 'agent-task-1',
+              toolUseId: 'agent-tool-1',
+              status: 'running',
+              taskType: 'local_agent',
+              description: 'Review screenshots',
+              startedAt: 1,
+              updatedAt: 2,
+            },
+          },
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'message_complete',
+      usage: { input_tokens: 12, output_tokens: 34 },
+    })
+
+    const session = useChatStore.getState().sessions[TEST_SESSION_ID]
+    expect(session?.messages).toMatchObject([
+      {
+        type: 'assistant_text',
+        content: 'Finished answer',
+      },
+    ])
+    expect(session?.messages).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'system', content: expect.stringContaining('Completed') }),
+    ]))
+    expect(session?.chatState).toBe('idle')
+    expect(updateTabStatusMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, 'running')
+  })
+
+  it('marks the tab idle and appends the delayed completion when the last background agent task finishes after the foreground turn', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'streaming',
+          elapsedSeconds: 65,
+          streamingText: 'Finished answer',
+          elapsedTimer: null,
+          backgroundAgentTasks: {
+            'agent-task-1': {
+              taskId: 'agent-task-1',
+              toolUseId: 'agent-tool-1',
+              status: 'running',
+              taskType: 'local_agent',
+              description: 'Review screenshots',
+              startedAt: 1,
+              updatedAt: 2,
+            },
+          },
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'message_complete',
+      usage: { input_tokens: 12, output_tokens: 34 },
+    })
+    expect(updateTabStatusMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, 'running')
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'system_notification',
+      subtype: 'task_notification',
+      data: {
+        task_id: 'agent-task-1',
+        tool_use_id: 'agent-tool-1',
+        status: 'completed',
+        summary: 'Review complete.',
+      },
+    })
+
+    expect(updateTabStatusMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, 'idle')
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'system', content: 'Completed in 1m 5s' }),
+    ]))
+  })
+
+  it('suppresses assistant output for a task-notification-only follow-up turn', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'idle',
+          elapsedSeconds: 718,
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'system_notification',
+      subtype: 'task_notification',
+      data: {
+        task_id: 'butp7dybq',
+        tool_use_id: 'toolu_bdrk_01SvH8CKoRoBcv1T1Gr9jWT3',
+        status: 'completed',
+        summary: 'Background command "1000 客户端压测并采样服务端内存" completed (exit code 0)',
+        output_file: '/tmp/butp7dybq.output',
+      },
+    })
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'thinking',
+      text: "The earlier monitoring command has already been handled by subsequent work, so there's nothing more to add here.",
+    })
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_start',
+      blockType: 'text',
+    })
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_delta',
+      text: '那是早前的监控命令收尾通知，已被后续的多核压测取代，无需处理。交付已全部完成并验证通过。',
+    })
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'message_complete',
+      usage: { input_tokens: 12, output_tokens: 34 },
+    })
+
+    const session = useChatStore.getState().sessions[TEST_SESSION_ID]
+    expect(session?.messages).toMatchObject([
+      {
+        type: 'background_task',
+        task: {
+          taskId: 'butp7dybq',
+          toolUseId: 'toolu_bdrk_01SvH8CKoRoBcv1T1Gr9jWT3',
+          status: 'completed',
+        },
+      },
+    ])
+    expect(session?.messages).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'thinking' }),
+      expect.objectContaining({ type: 'assistant_text' }),
+      expect.objectContaining({ type: 'system', content: 'Completed in 11m 58s' }),
+    ]))
+    expect(session?.chatState).toBe('idle')
+    expect(updateTabStatusMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, 'idle')
+  })
+
+  it('flushes a delayed completion before a new user turn while background tasks keep running', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'streaming',
+          elapsedSeconds: 65,
+          streamingText: 'Finished answer',
+          elapsedTimer: null,
+          backgroundAgentTasks: {
+            'agent-task-1': {
+              taskId: 'agent-task-1',
+              toolUseId: 'agent-tool-1',
+              status: 'running',
+              taskType: 'local_agent',
+              description: 'Review screenshots',
+              startedAt: 1,
+              updatedAt: 2,
+            },
+          },
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'message_complete',
+      usage: { input_tokens: 12, output_tokens: 34 },
+    })
+    useChatStore.getState().sendMessage(TEST_SESSION_ID, 'Continue with next step')
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages).toMatchObject([
+      { type: 'assistant_text', content: 'Finished answer' },
+      { type: 'system', content: 'Completed in 1m 5s' },
+      { type: 'user_text', content: 'Continue with next step' },
+    ])
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'system_notification',
+      subtype: 'task_notification',
+      data: {
+        task_id: 'agent-task-1',
+        tool_use_id: 'agent-tool-1',
+        status: 'completed',
+        summary: 'Review complete.',
+      },
+    })
+
+    const completedRows = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+      .filter((message) => message.type === 'system' && message.content === 'Completed in 1m 5s')
+    expect(completedRows).toHaveLength(1)
   })
 
   it('tracks API retry status until the request finishes', () => {
@@ -2601,6 +3584,72 @@ describe('chatStore history mapping', () => {
     })
 
     expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.apiRetry).toBeNull()
+  })
+
+  it('tracks the streaming fallback notice and supersedes a stale retry banner', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [],
+          chatState: 'thinking',
+          statusVerb: 'Thinking',
+          apiRetry: {
+            attempt: 10,
+            maxRetries: 10,
+            retryDelayMs: 1000,
+            errorStatus: 529,
+            receivedAt: Date.now() - 5_000,
+          },
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'streaming_fallback',
+      cause: 'watchdog',
+    })
+
+    const fallbackSession = useChatStore.getState().sessions[TEST_SESSION_ID]
+    expect(fallbackSession?.streamingFallback).toMatchObject({ cause: 'watchdog' })
+    // 旧的流式重试横幅针对已放弃的请求，必须被降级提示接管。
+    expect(fallbackSession?.apiRetry).toBeNull()
+    expect(fallbackSession?.chatState).toBe('thinking')
+    expect(fallbackSession?.statusVerb).toBe('')
+    expect(updateTabStatusMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, 'running')
+
+    // 非流式响应的首个内容块到达即清除降级提示。
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_start',
+      blockType: 'text',
+    })
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.streamingFallback).toBeNull()
+  })
+
+  it('keeps the fallback notice when idle and clears it on turn completion', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [],
+          chatState: 'idle',
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'streaming_fallback',
+      cause: '404_stream_creation',
+    })
+
+    // idle 会话收到降级信号说明回合仍在跑，状态条要回到 thinking。
+    const session = useChatStore.getState().sessions[TEST_SESSION_ID]
+    expect(session?.chatState).toBe('thinking')
+    expect(session?.streamingFallback).toMatchObject({ cause: '404_stream_creation' })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'message_complete',
+      usage: { input_tokens: 1, output_tokens: 0 },
+    })
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.streamingFallback).toBeNull()
   })
 
   it('renders memory saved notifications as chat memory events', () => {
@@ -2774,6 +3823,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2819,6 +3869,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2926,6 +3977,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -2996,6 +4048,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3131,6 +4184,100 @@ describe('chatStore history mapping', () => {
     vi.useRealTimers()
   })
 
+  it('does not duplicate the current prompt when CLI replays it after thinking starts', () => {
+    const prompt = '# 角色与目标\n构建一个协同编辑器'
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [
+            {
+              id: 'live-user',
+              type: 'user_text',
+              content: prompt,
+              timestamp: 1,
+            },
+          ],
+          chatState: 'thinking',
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'thinking',
+      text: 'I need to plan the implementation.',
+    })
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'user_message_replay',
+      content: prompt,
+    })
+
+    const userMessages = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+      .filter((message) => message.type === 'user_text')
+    expect(userMessages).toHaveLength(1)
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages).toMatchObject([
+      { type: 'user_text', content: prompt },
+      { type: 'thinking', content: 'I need to plan the implementation.' },
+    ])
+  })
+
+  it('does not leak an image-bearing prompt when the replay appends [Image source] metadata (Windows path)', () => {
+    // The optimistic message (e.g. a visual-selection annotation card) stores the
+    // prompt body in modelContent with a hidden display. The CLI replay carries
+    // the server-appended `[Image source: …]` line on the same text. Dedupe must
+    // still match — otherwise the raw prompt + absolute upload path leak in as a
+    // second grey bubble (the reported Windows regression).
+    const prompt = '请根据截图中编号 1 的蓝色标注修改本地前端。\n目标元素：<button>'
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [
+            {
+              id: 'live-user',
+              type: 'user_text',
+              content: '',
+              modelContent: prompt,
+              timestamp: 1,
+            },
+          ],
+          chatState: 'thinking',
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'user_message_replay',
+      content: `${prompt}\n[Image source: C:\\Users\\Relakkes\\.claude\\uploads\\sid\\82017405-_button_.png]`,
+    })
+
+    const userMessages = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+      .filter((message) => message.type === 'user_text')
+    expect(userMessages).toHaveLength(1)
+    expect(userMessages?.[0]).toMatchObject({ content: '', modelContent: prompt })
+  })
+
+  it('dedupes an image-bearing prompt when the replay appends detailed (macOS) image metadata', () => {
+    const prompt = 'describe this screenshot for me'
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [
+            { id: 'live-user', type: 'user_text', content: prompt, timestamp: 1 },
+          ],
+          chatState: 'thinking',
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'user_message_replay',
+      content: `${prompt}\n[Image: source: /Users/me/.claude/uploads/sid/a.png, original 1024x768, displayed at 512x384. Multiply coordinates by 2 to map to original image.]`,
+    })
+
+    const userMessages = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+      .filter((message) => message.type === 'user_text')
+    expect(userMessages).toHaveLength(1)
+  })
+
   it('flushes pending text before appending an error message', () => {
     vi.useFakeTimers()
 
@@ -3180,7 +4327,10 @@ describe('chatStore history mapping', () => {
 
     useChatStore.getState().stopGeneration('session-a')
 
-    expect(useChatStore.getState().sessions['session-a']?.streamingText).toBe('A-only response')
+    expect(useChatStore.getState().sessions['session-a']?.streamingText).toBe('')
+    expect(useChatStore.getState().sessions['session-a']?.messages).toMatchObject([
+      { type: 'assistant_text', content: 'A-only response' },
+    ])
     expect(useChatStore.getState().sessions['session-b']?.streamingText).toBe('')
 
     useChatStore.getState().handleServerMessage('session-b', {
@@ -3286,6 +4436,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3388,6 +4539,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3440,6 +4592,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3472,6 +4625,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3513,6 +4667,7 @@ describe('chatStore history mapping', () => {
             },
           },
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3577,6 +4732,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3618,6 +4774,7 @@ describe('chatStore history mapping', () => {
           pendingPermission: null,
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],
@@ -3653,5 +4810,58 @@ describe('chatStore history mapping', () => {
       content: '开始优化UI',
       attachments: undefined,
     })
+  })
+
+  // issue #757: the streaming indicator estimates this turn's output tokens
+  // from streamed characters (÷4, mirroring the CLI spinner) instead of
+  // showing the previous turn's stale usage.
+  it('accumulates streamed text, tool input, and thinking chars for the token estimate', () => {
+    vi.useFakeTimers()
+    useChatStore.setState({ sessions: { [TEST_SESSION_ID]: makeSession() } })
+
+    const charsOf = () =>
+      useChatStore.getState().sessions[TEST_SESSION_ID]?.streamingResponseChars
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_delta',
+      text: 'a'.repeat(40),
+    })
+    vi.advanceTimersByTime(60)
+    expect(charsOf()).toBe(40)
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_delta',
+      toolInput: '{"a":1}',
+    })
+    vi.advanceTimersByTime(60)
+    expect(charsOf()).toBe(47)
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'thinking',
+      text: 'pondering',
+    })
+    expect(charsOf()).toBe(56)
+
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+  })
+
+  it('resets the streaming token estimate when the user sends the next message', () => {
+    vi.useFakeTimers()
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'idle',
+          streamingResponseChars: 4321,
+        }),
+      },
+    })
+
+    useChatStore.getState().sendMessage(TEST_SESSION_ID, '继续')
+
+    const session = useChatStore.getState().sessions[TEST_SESSION_ID]
+    expect(session?.streamingResponseChars).toBe(0)
+    if (session?.elapsedTimer) clearInterval(session.elapsedTimer)
+    vi.useRealTimers()
   })
 })

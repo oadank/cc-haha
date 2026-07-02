@@ -1,4 +1,5 @@
 import { useRef, useEffect, useMemo, memo, useState, useCallback, useDeferredValue, useLayoutEffect, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { ArrowDown, BookMarked, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, FileStack, LoaderCircle, MessageCircle, Settings, Target, XCircle } from 'lucide-react'
 import { ApiError } from '../../api/client'
 import { sessionsApi, type SessionTurnCheckpoint } from '../../api/sessions'
@@ -22,6 +23,9 @@ import { StreamingIndicator } from './StreamingIndicator'
 import { InlineTaskSummary } from './InlineTaskSummary'
 import { CurrentTurnChangeCard } from './CurrentTurnChangeCard'
 import type { AgentTaskNotification, UIMessage } from '../../types/chat'
+import { formatTokenCount } from '../../lib/formatTokenCount'
+import { formatDurationMs, hasRunningBackgroundTasks as hasAnyRunningBackgroundTasks } from '../../lib/backgroundTasks'
+import { isTouchH5Document } from '../../lib/touchH5'
 import { ConfirmDialog } from '../shared/ConfirmDialog'
 import { clearWindowSelection, getSelectionPopoverPosition, useSelectionPopoverDismiss } from '../../hooks/useSelectionPopoverDismiss'
 import {
@@ -67,12 +71,19 @@ type TurnChangeCardModel = {
   isLatest: boolean
 }
 
+const EMPTY_TURN_CHANGE_CARDS: TurnChangeCardModel[] = []
+
 type ChatMessageRole = 'user' | 'assistant'
 
 type ChatSelectionState = {
   text: string
   x: number
   y: number
+}
+
+type SelectionPointer = {
+  clientX: number
+  clientY: number
 }
 
 const CHAT_SELECTION_MENU_OFFSET = 10
@@ -95,7 +106,7 @@ function getChatSelectionPosition(range: Range, root: HTMLElement, pointer: { cl
 
 function getChatSelectionFromContainer(
   root: HTMLElement | null,
-  pointer: { clientX: number; clientY: number },
+  pointer: SelectionPointer,
 ): ChatSelectionState | null {
   if (!root) return null
   const selection = window.getSelection()
@@ -117,6 +128,13 @@ function getChatSelectionFromContainer(
   }
 }
 
+function getSelectionPointer(event: SelectionPointer): SelectionPointer {
+  return {
+    clientX: event.clientX,
+    clientY: event.clientY,
+  }
+}
+
 function ChatSelectionMenu({
   selection,
   onAdd,
@@ -129,7 +147,7 @@ function ChatSelectionMenu({
   const t = useTranslation()
   if (!selection) return null
 
-  return (
+  return createPortal(
     <button
       ref={popoverRef}
       type="button"
@@ -140,13 +158,9 @@ function ChatSelectionMenu({
     >
       <MessageCircle size={21} strokeWidth={2.15} className="shrink-0 text-[var(--color-text-primary)]" aria-hidden="true" />
       <span>{t('chat.addSelectionToChat')}</span>
-    </button>
+    </button>,
+    document.body,
   )
-}
-
-function formatCompactTokenCount(tokens: number): string {
-  if (tokens >= 1000) return `${Math.round(tokens / 100) / 10}k`
-  return String(tokens)
 }
 
 function getCompactSummaryTitle(message: CompactSummaryEvent, t: ReturnType<typeof useTranslation>) {
@@ -165,7 +179,7 @@ function CompactStatusDivider({ message, state }: { message?: CompactSummaryEven
   const meta = [
     message?.trigger ? t(`chat.compactSummary.trigger.${message.trigger}` as TranslationKey) : null,
     typeof message?.preTokens === 'number'
-      ? t('chat.compactSummary.tokens', { count: formatCompactTokenCount(message.preTokens) })
+      ? t('chat.compactSummary.tokens', { count: formatTokenCount(message.preTokens) })
       : null,
     typeof message?.messagesSummarized === 'number'
       ? t('chat.compactSummary.messages', { count: String(message.messagesSummarized) })
@@ -289,12 +303,29 @@ function GoalEventCard({ message }: { message: GoalEvent }) {
   )
 }
 
-function formatBackgroundTaskDuration(durationMs?: number) {
-  if (typeof durationMs !== 'number' || durationMs < 0) return null
-  const seconds = Math.round(durationMs / 1000)
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  return `${minutes}m ${seconds % 60}s`
+function GoalContinuationDivider({ message }: { message: GoalEvent }) {
+  const t = useTranslation()
+  const reason = message.message?.replace(/^Goal continuing:\s*/i, '').trim()
+
+  return (
+    <section data-testid="goal-continuation-divider" className="my-4 w-full px-1">
+      <div className="flex w-full items-center gap-3">
+        <div className="h-px flex-1 bg-[var(--color-border)]" aria-hidden="true" />
+        <div className="inline-flex min-h-8 max-w-[min(78vw,620px)] items-center gap-2 rounded-md px-2.5 py-1 text-[13px] font-medium text-[var(--color-text-secondary)]">
+          <Target size={16} strokeWidth={2.1} className="shrink-0 text-[var(--color-memory-accent)]" aria-hidden="true" />
+          <span className="shrink-0 font-semibold text-[var(--color-text-primary)]">
+            {t('chat.goalEvent.continuing')}
+          </span>
+          {reason ? (
+            <span className="min-w-0 truncate text-[12px] text-[var(--color-text-tertiary)]" title={reason}>
+              {reason}
+            </span>
+          ) : null}
+        </div>
+        <div className="h-px flex-1 bg-[var(--color-border)]" aria-hidden="true" />
+      </div>
+    </section>
+  )
 }
 
 function BackgroundTaskEventCard({ message }: { message: BackgroundTaskEvent }) {
@@ -303,7 +334,7 @@ function BackgroundTaskEventCard({ message }: { message: BackgroundTaskEvent }) 
   const isRunning = task.status === 'running'
   const isFailed = task.status === 'failed'
   const isStopped = task.status === 'stopped'
-  const duration = formatBackgroundTaskDuration(task.usage?.durationMs)
+  const duration = formatDurationMs(task.usage?.durationMs, t)
   const detail = task.summary || task.lastToolName || task.description || task.outputFile || task.taskId
   const label = getBackgroundTaskLabel(task.taskType, t)
 
@@ -336,7 +367,7 @@ function BackgroundTaskEventCard({ message }: { message: BackgroundTaskEvent }) 
             </span>
             {task.usage?.totalTokens ? (
               <span className="hidden shrink-0 text-[11px] text-[var(--color-text-tertiary)] sm:inline">
-                {t('chat.backgroundAgents.tokens', { count: task.usage.totalTokens.toLocaleString() })}
+                {t('chat.backgroundAgents.tokens', { count: formatTokenCount(task.usage.totalTokens) })}
               </span>
             ) : null}
             {duration ? (
@@ -388,6 +419,8 @@ function SelectableChatMessage({
 }) {
   const rootRef = useRef<HTMLDivElement>(null)
   const selectionMenuRef = useRef<HTMLButtonElement>(null)
+  const lastSelectionPointerRef = useRef<SelectionPointer | null>(null)
+  const selectionUpdateFrameRef = useRef<number | null>(null)
   const addReference = useWorkspaceChatContextStore((state) => state.addReference)
   const [selectionMenu, setSelectionMenu] = useState<ChatSelectionState | null>(null)
   const t = useTranslation()
@@ -397,11 +430,76 @@ function SelectableChatMessage({
 
   useEffect(() => {
     setSelectionMenu(null)
+    lastSelectionPointerRef.current = null
   }, [content, messageId])
 
   const dismissSelectionMenu = useCallback(() => {
     setSelectionMenu(null)
   }, [])
+
+  const queueSelectionMenuUpdate = useCallback((pointer?: SelectionPointer) => {
+    if (pointer) lastSelectionPointerRef.current = pointer
+
+    if (selectionUpdateFrameRef.current !== null) {
+      window.cancelAnimationFrame(selectionUpdateFrameRef.current)
+    }
+
+    selectionUpdateFrameRef.current = window.requestAnimationFrame(() => {
+      selectionUpdateFrameRef.current = window.requestAnimationFrame(() => {
+        selectionUpdateFrameRef.current = null
+        const root = rootRef.current
+        const rootRect = root?.getBoundingClientRect()
+        const fallbackPointer = lastSelectionPointerRef.current ?? {
+          clientX: (rootRect?.left ?? 0) + 24,
+          clientY: (rootRect?.top ?? 0) + 24,
+        }
+        setSelectionMenu(getChatSelectionFromContainer(root, fallbackPointer))
+      })
+    })
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (selectionUpdateFrameRef.current !== null) {
+        window.cancelAnimationFrame(selectionUpdateFrameRef.current)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      lastSelectionPointerRef.current = getSelectionPointer(event)
+    }
+
+    const handlePointerUp = (event: PointerEvent) => {
+      queueSelectionMenuUpdate(getSelectionPointer(event))
+    }
+
+    const handleMouseUp = (event: MouseEvent) => {
+      queueSelectionMenuUpdate(getSelectionPointer(event))
+    }
+
+    const handleSelectionChange = () => {
+      queueSelectionMenuUpdate()
+    }
+
+    const handleKeyUp = () => {
+      queueSelectionMenuUpdate()
+    }
+
+    document.addEventListener('pointerdown', handlePointerDown, true)
+    document.addEventListener('pointerup', handlePointerUp, true)
+    document.addEventListener('mouseup', handleMouseUp, true)
+    document.addEventListener('selectionchange', handleSelectionChange)
+    document.addEventListener('keyup', handleKeyUp, true)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true)
+      document.removeEventListener('pointerup', handlePointerUp, true)
+      document.removeEventListener('mouseup', handleMouseUp, true)
+      document.removeEventListener('selectionchange', handleSelectionChange)
+      document.removeEventListener('keyup', handleKeyUp, true)
+    }
+  }, [queueSelectionMenuUpdate])
 
   useSelectionPopoverDismiss({
     active: Boolean(selectionMenu),
@@ -426,8 +524,13 @@ function SelectableChatMessage({
   return (
     <div
       ref={rootRef}
+      data-chat-selectable-message={role}
+      onPointerDown={(event) => {
+        if (event.pointerType === 'mouse' && event.button !== 0) return
+        lastSelectionPointerRef.current = getSelectionPointer(event)
+      }}
       onMouseUp={(event) => {
-        setSelectionMenu(getChatSelectionFromContainer(rootRef.current, event))
+        queueSelectionMenuUpdate(getSelectionPointer(event))
       }}
       onKeyDown={(event) => {
         if (event.key === 'Escape') setSelectionMenu(null)
@@ -687,6 +790,40 @@ function buildTurnCardInsertionMap(
   return cardsByRenderIndex
 }
 
+/**
+ * Map each render item to the REAL changed files of the turn it belongs to, so an
+ * assistant message can anchor its output chips on files that were actually
+ * written this turn instead of guessing paths from the prose. Items are attributed
+ * to the most recent preceding non-pending user message (the turn boundary).
+ */
+function buildChangedFilesByRenderIndex(
+  renderItems: RenderItem[],
+  turnChangeCards: TurnChangeCardModel[],
+): Map<number, string[]> {
+  const filesByTurnId = new Map<string, string[]>()
+  for (const card of turnChangeCards) {
+    if (card.checkpoint.code.filesChanged.length > 0) {
+      filesByTurnId.set(card.target.messageId, card.checkpoint.code.filesChanged)
+    }
+  }
+  if (filesByTurnId.size === 0) return new Map()
+
+  const filesByRenderIndex = new Map<number, string[]>()
+  let activeTurnId: string | null = null
+  renderItems.forEach((item, index) => {
+    if (item.kind === 'message' && item.message.type === 'user_text' && !item.message.pending) {
+      activeTurnId = item.message.id
+      return
+    }
+    if (activeTurnId) {
+      const files = filesByTurnId.get(activeTurnId)
+      if (files) filesByRenderIndex.set(index, files)
+    }
+  })
+
+  return filesByRenderIndex
+}
+
 function getApiErrorMessage(error: unknown) {
   return error instanceof ApiError
     ? typeof error.body === 'object' && error.body && 'message' in error.body
@@ -791,6 +928,11 @@ const SCROLL_BOTTOM_SENTINEL = 1_000_000_000
 const MAX_SCROLL_SNAPSHOTS = 100
 const VIRTUALIZE_MIN_RENDER_ITEMS = 120
 const VIRTUALIZE_MIN_CONTENT_CHARS = 120_000
+// Touch-H5 disables content-visibility paint skipping for selection
+// correctness (globals.css), which makes virtualization the only paint bound
+// for long transcripts there — so it kicks in at half the desktop thresholds.
+const TOUCH_H5_VIRTUALIZE_MIN_RENDER_ITEMS = 60
+const TOUCH_H5_VIRTUALIZE_MIN_CONTENT_CHARS = 60_000
 const VIRTUAL_OVERSCAN_PX = 1200
 const VIRTUAL_DEFAULT_VIEWPORT_HEIGHT = 720
 const VIRTUAL_MIN_ITEM_HEIGHT = 48
@@ -950,13 +1092,18 @@ function getRenderItemContentWeight(item: RenderItem): number {
   return item.toolCalls.reduce((total, toolCall) => total + getMessageContentWeight(toolCall), 0)
 }
 
-function shouldVirtualizeRenderItems(metrics: VirtualRenderItemMetric[]) {
-  if (metrics.length >= VIRTUALIZE_MIN_RENDER_ITEMS) return true
+export function shouldVirtualizeRenderItems(
+  metrics: VirtualRenderItemMetric[],
+  touchH5 = isTouchH5Document(),
+) {
+  const minRenderItems = touchH5 ? TOUCH_H5_VIRTUALIZE_MIN_RENDER_ITEMS : VIRTUALIZE_MIN_RENDER_ITEMS
+  const minContentChars = touchH5 ? TOUCH_H5_VIRTUALIZE_MIN_CONTENT_CHARS : VIRTUALIZE_MIN_CONTENT_CHARS
+  if (metrics.length >= minRenderItems) return true
 
   let totalWeight = 0
   for (const metric of metrics) {
     totalWeight += metric.contentWeight
-    if (totalWeight >= VIRTUALIZE_MIN_CONTENT_CHARS) return true
+    if (totalWeight >= minContentChars) return true
   }
   return false
 }
@@ -1024,7 +1171,7 @@ function getMessageMetricSignature(message: UIMessage): string {
     case 'system':
       return `${message.type}:${message.content.length}`
     case 'tool_use':
-      return `${message.type}:${message.toolName}:${message.toolUseId}:${message.partialInput?.length ?? 0}:${message.isPending ? 1 : 0}`
+      return `${message.type}:${message.toolName}:${message.toolUseId}:${message.partialInput?.length ?? 0}:${message.isPending ? 1 : 0}:${message.status ?? ''}`
     case 'tool_result':
       return `${message.type}:${message.toolUseId}:${message.isError ? 1 : 0}`
     case 'compact_summary':
@@ -1222,8 +1369,10 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
   const messages = sessionState?.messages ?? EMPTY_MESSAGES
   const chatState = sessionState?.chatState ?? 'idle'
   const streamingText = sessionState?.streamingText ?? ''
+  const streamingToolInput = sessionState?.streamingToolInput ?? ''
   const activeThinkingId = sessionState?.activeThinkingId ?? null
   const agentTaskNotifications = sessionState?.agentTaskNotifications ?? EMPTY_AGENT_TASK_NOTIFICATIONS
+  const hasRunningBackgroundTasks = hasAnyRunningBackgroundTasks(sessionState?.backgroundAgentTasks)
   const activeAskUserQuestionToolUseId =
     sessionState?.pendingPermission?.toolName === 'AskUserQuestion'
       ? sessionState.pendingPermission.toolUseId
@@ -1269,6 +1418,7 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
   const branchActionsDisabled =
     isMemberSession ||
     chatState !== 'idle' ||
+    hasRunningBackgroundTasks ||
     streamingText.trim().length > 0 ||
     Boolean(activeThinkingId) ||
     Boolean(sessionState?.activeToolUseId) ||
@@ -1378,11 +1528,16 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
     // prevent the jump-to-latest button from flickering during auto-scroll.
     const container = scrollContainerRef.current
     if (!container) return
-    const shouldIgnoreRecentProgrammaticScroll =
-      performance.now() < ignoreProgrammaticScrollUntilRef.current &&
+    const matchesProgrammaticScrollTop =
       ignoreProgrammaticScrollTopRef.current !== null &&
       Math.abs(container.scrollTop - ignoreProgrammaticScrollTopRef.current) < 1
-    if (isProgrammaticScrollingRef.current || shouldIgnoreRecentProgrammaticScroll) {
+    const shouldIgnoreRecentProgrammaticScroll =
+      matchesProgrammaticScrollTop &&
+      (
+        isProgrammaticScrollingRef.current ||
+        performance.now() < ignoreProgrammaticScrollUntilRef.current
+      )
+    if (shouldIgnoreRecentProgrammaticScroll) {
       syncVirtualViewportFromContainer(container)
       return
     }
@@ -1476,7 +1631,7 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
     }
 
     scrollToBottom('auto')
-  }, [messages.length, resolvedSessionId, scrollToBottom, streamingText])
+  }, [messages.length, resolvedSessionId, scrollToBottom, streamingText, streamingToolInput])
 
   const handleJumpToLatest = useCallback(() => {
     scrollToBottom('auto')
@@ -1507,6 +1662,24 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
     return () => observer.disconnect()
   }, [scrollToBottom, shouldFollowContentResize])
 
+  // Touch-H5 only: the visual-viewport fit (touchH5.ts) shrinks the scroll
+  // container when the soft keyboard opens. If the user was reading the tail,
+  // keep the latest message pinned above the keyboard instead of letting the
+  // shorter container cut it off.
+  useEffect(() => {
+    if (!isTouchH5Document()) return
+    const container = scrollContainerRef.current
+    if (!container || typeof ResizeObserver === 'undefined') return
+
+    const observer = new ResizeObserver(() => {
+      if (!shouldAutoScrollRef.current) return
+      scrollToBottom('auto')
+    })
+    observer.observe(container)
+
+    return () => observer.disconnect()
+  }, [scrollToBottom])
+
   const { toolResultMap, childToolCallsByParent, renderItems } = useMemo(
     () => buildRenderModel(messages, activeAskUserQuestionToolUseId),
     [activeAskUserQuestionToolUseId, messages],
@@ -1530,9 +1703,14 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
     completedTurnTargets.length > 0
       ? completedTurnTargets[completedTurnTargets.length - 1]?.messageId ?? null
       : null
+  const visibleTurnChangeCards = hasRunningBackgroundTasks ? EMPTY_TURN_CHANGE_CARDS : turnChangeCards
   const turnCardsByRenderIndex = useMemo(
-    () => buildTurnCardInsertionMap(renderItems, turnChangeCards),
-    [renderItems, turnChangeCards],
+    () => buildTurnCardInsertionMap(renderItems, visibleTurnChangeCards),
+    [renderItems, visibleTurnChangeCards],
+  )
+  const changedFilesByRenderIndex = useMemo(
+    () => buildChangedFilesByRenderIndex(renderItems, visibleTurnChangeCards),
+    [renderItems, visibleTurnChangeCards],
   )
   const renderItemKeys = useMemo(
     () => renderItems.map(getRenderItemKey),
@@ -1567,8 +1745,8 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
     [measuredItemsVersion, renderItemKeys, renderItemMetrics, renderItems, virtualViewport],
   )
   const confirmTurnCard = useMemo(
-    () => turnChangeCards.find((card) => card.target.messageId === turnUndoConfirmTargetId) ?? null,
-    [turnChangeCards, turnUndoConfirmTargetId],
+    () => visibleTurnChangeCards.find((card) => card.target.messageId === turnUndoConfirmTargetId) ?? null,
+    [turnUndoConfirmTargetId, visibleTurnChangeCards],
   )
 
   useEffect(() => {
@@ -1591,6 +1769,12 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
   useEffect(() => {
     if (!resolvedSessionId || completedTurnTargets.length === 0 || isMemberSession) {
       setTurnChangeCards([])
+      setTurnChangeLoadError(null)
+      setIsLoadingTurnChangeCards(false)
+      return
+    }
+
+    if (hasRunningBackgroundTasks) {
       setTurnChangeLoadError(null)
       setIsLoadingTurnChangeCards(false)
       return
@@ -1650,10 +1834,10 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
     return () => {
       cancelled = true
     }
-  }, [chatState, completedTurnTargets, isMemberSession, latestCompletedTurnId, resolvedSessionId])
+  }, [chatState, completedTurnTargets, hasRunningBackgroundTasks, isMemberSession, latestCompletedTurnId, resolvedSessionId])
 
   const handleUndoCurrentTurn = useCallback(async () => {
-    if (!resolvedSessionId || !confirmTurnCard || rewindingTurnId) return
+    if (!resolvedSessionId || !confirmTurnCard || rewindingTurnId || hasRunningBackgroundTasks) return
 
     const target = confirmTurnCard.target
     setRewindingTurnId(target.messageId)
@@ -1706,6 +1890,7 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
     addToast,
     chatState,
     confirmTurnCard,
+    hasRunningBackgroundTasks,
     queueComposerPrefill,
     reloadHistory,
     resolvedSessionId,
@@ -1792,6 +1977,7 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
                 : null
             }
             branchAction={branchActionByMessageId.get(item.message.id)}
+            turnChangedFiles={changedFilesByRenderIndex.get(index)}
           />
         )}
 
@@ -1867,7 +2053,7 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
             <StreamingIndicator />
           )}
 
-          {!isLoadingTurnChangeCards && turnChangeCards.length === 0 && turnChangeLoadError && (
+          {!isLoadingTurnChangeCards && visibleTurnChangeCards.length === 0 && turnChangeLoadError && (
             <div className="mx-auto mb-5 w-full max-w-[860px] rounded-[var(--radius-lg)] border border-[var(--color-error)]/25 bg-[var(--color-error-container)]/18 px-4 py-3 text-xs text-[var(--color-error)]">
               {turnChangeLoadError}
             </div>
@@ -1922,6 +2108,7 @@ export const MessageBlock = memo(function MessageBlock({
   agentTaskNotifications,
   toolResult,
   branchAction,
+  turnChangedFiles,
 }: {
   sessionId?: string | null
   message: UIMessage
@@ -1933,6 +2120,7 @@ export const MessageBlock = memo(function MessageBlock({
     loading?: boolean
     onBranch: () => void
   }
+  turnChangedFiles?: string[]
 }) {
   const t = useTranslation()
 
@@ -1966,6 +2154,7 @@ export const MessageBlock = memo(function MessageBlock({
             branchAction={branchAction}
             sessionId={sessionId ?? undefined}
             timestamp={message.timestamp}
+            turnChangedFiles={turnChangedFiles}
           />
         </SelectableChatMessage>
       )
@@ -1988,6 +2177,7 @@ export const MessageBlock = memo(function MessageBlock({
           input={message.input}
           result={toolResult}
           isPending={message.isPending}
+          status={message.status}
           partialInput={message.partialInput}
           agentTaskNotification={
             message.toolName === 'Agent'
@@ -2050,7 +2240,9 @@ export const MessageBlock = memo(function MessageBlock({
     case 'compact_summary':
       return <CompactStatusDivider message={message} state={message.phase === 'compacting' ? 'compacting' : 'complete'} />
     case 'goal_event':
-      return <GoalEventCard message={message} />
+      return message.action === 'status' && message.status === 'continuing'
+        ? <GoalContinuationDivider message={message} />
+        : <GoalEventCard message={message} />
     case 'background_task':
       return <BackgroundTaskEventCard message={message} />
     case 'system':

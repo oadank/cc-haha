@@ -2,8 +2,12 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import * as fs from 'fs/promises'
 import * as os from 'os'
 import * as path from 'path'
-import { handleProxyRequest } from '../proxy/handler.js'
+import { handleProxyRequest, withStreamIdleTimeout } from '../proxy/handler.js'
 import { ProviderService } from '../services/providerService.js'
+import {
+  clearTraceCaptureStateForTests,
+  traceCaptureService,
+} from '../services/traceCaptureService.js'
 import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
 
 let tmpDir: string
@@ -14,6 +18,7 @@ async function setup() {
   originalConfigDir = process.env.CLAUDE_CONFIG_DIR
   process.env.CLAUDE_CONFIG_DIR = tmpDir
   resetSettingsCache()
+  clearTraceCaptureStateForTests()
 }
 
 async function teardown() {
@@ -23,7 +28,17 @@ async function teardown() {
     delete process.env.CLAUDE_CONFIG_DIR
   }
   resetSettingsCache()
+  clearTraceCaptureStateForTests()
   await fs.rm(tmpDir, { recursive: true, force: true })
+}
+
+async function waitForTraceCall(sessionId: string) {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const trace = await traceCaptureService.getSessionTrace(sessionId)
+    if (trace.calls.length > 0 && trace.calls[0]?.response) return trace
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  return traceCaptureService.getSessionTrace(sessionId)
 }
 
 describe('proxy network settings', () => {
@@ -180,7 +195,71 @@ describe('proxy network settings', () => {
     }
   })
 
-  test('uses configured AI request timeout only while opening streaming upstream requests', async () => {
+  test('records redacted OpenAI proxy request headers in trace capture', async () => {
+    const svc = new ProviderService()
+    const provider = await svc.addProvider({
+      presetId: 'custom',
+      name: 'OpenAI Trace Proxy',
+      baseUrl: 'https://api.example.com',
+      apiKey: 'sk-trace-secret',
+      apiFormat: 'openai_chat',
+      models: {
+        main: 'model-main',
+        haiku: 'model-main',
+        sonnet: 'model-main',
+        opus: 'model-main',
+      },
+    })
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mock(async (_url: string | URL | Request, _init?: RequestInit) => {
+      return new Response(JSON.stringify({
+        id: 'chatcmpl-trace-headers',
+        object: 'chat.completion',
+        created: 0,
+        model: 'model-main',
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: 'ok' },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      const req = new Request(
+        `http://localhost:3456/proxy/providers/${provider.id}/v1/messages`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-claude-code-session-id': 'session-proxy-trace-headers',
+          },
+          body: JSON.stringify({
+            model: 'model-main',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        },
+      )
+
+      const res = await handleProxyRequest(req, new URL(req.url))
+      expect(res.status).toBe(200)
+
+      const trace = await waitForTraceCall('session-proxy-trace-headers')
+      expect(trace.calls).toHaveLength(1)
+      expect(trace.calls[0].request.headers.Authorization).toBe('[redacted]')
+      expect(trace.calls[0].request.headers['Content-Type']).toBe('application/json')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('uses configured AI request timeout while opening and reading streaming upstream requests', async () => {
     await fs.writeFile(
       path.join(tmpDir, 'settings.json'),
       JSON.stringify({
@@ -262,12 +341,67 @@ describe('proxy network settings', () => {
 
       expect(res.status).toBe(200)
       expect(timeoutCalls).toEqual([])
-      expect(timers).toEqual([{ ms: 180_000, cleared: true }])
+      expect(timers).toEqual([
+        { ms: 180_000, cleared: true },
+        { ms: 180_000, cleared: true },
+        { ms: 180_000, cleared: true },
+      ])
     } finally {
       globalThis.clearTimeout = originalClearTimeout
       globalThis.setTimeout = originalSetTimeout
       AbortSignal.timeout = originalTimeout
       globalThis.fetch = originalFetch
     }
+  })
+
+  test('fails a streaming upstream body that stops producing chunks', async () => {
+    const stalled = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {\"id\":\"chunk-1\",\"choices\":[]}\n\n'))
+      },
+    })
+
+    await expect(new Response(withStreamIdleTimeout(stalled, 20)).text())
+      .rejects
+      .toThrow('Upstream stream idle timeout after 20ms')
+  })
+
+  test('propagates streaming upstream body errors before the idle timeout fires', async () => {
+    let pulls = 0
+    const upstream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1
+        if (pulls === 1) {
+          controller.enqueue(new TextEncoder().encode('data: {\"id\":\"chunk-1\",\"choices\":[]}\n\n'))
+          return
+        }
+        controller.error(new Error('upstream body failed'))
+      },
+    })
+    const reader = withStreamIdleTimeout(upstream, 1_000).getReader()
+
+    expect(await reader.read()).toEqual({
+      done: false,
+      value: new TextEncoder().encode('data: {\"id\":\"chunk-1\",\"choices\":[]}\n\n'),
+    })
+    await expect(reader.read()).rejects.toThrow('upstream body failed')
+  })
+
+  test('cancels the upstream body when the downstream stream is canceled', async () => {
+    let cancelReason: unknown = null
+    const upstream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {\"id\":\"chunk-1\",\"choices\":[]}\n\n'))
+      },
+      cancel(reason) {
+        cancelReason = reason
+      },
+    })
+    const reader = withStreamIdleTimeout(upstream, 1_000).getReader()
+
+    expect((await reader.read()).done).toBe(false)
+    await reader.cancel('downstream closed')
+
+    expect(cancelReason).toBe('downstream closed')
   })
 })

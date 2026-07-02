@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import '@testing-library/jest-dom'
 import type { PerSessionState } from '../../stores/chatStore'
 import type { ChatState } from '../../types/chat'
+import { browserHost } from '../../lib/desktopHost/browserHost'
 
 const startDraggingMock = vi.hoisted(() => vi.fn(() => Promise.resolve()))
 const getCurrentWindowMock = vi.hoisted(() => vi.fn(() => ({
@@ -29,6 +30,7 @@ function makeChatSession(chatState: ChatState): PerSessionState {
     pendingPermission: null,
     pendingComputerUsePermission: null,
     tokenUsage: { input_tokens: 0, output_tokens: 0 },
+    streamingResponseChars: 0,
     elapsedSeconds: 0,
     statusVerb: '',
     slashCommands: [],
@@ -98,6 +100,22 @@ vi.mock('./WindowControls', () => ({
 }))
 
 describe('TabBar', () => {
+  const installElectronDesktopHost = () => {
+    window.desktopHost = {
+      ...browserHost,
+      kind: 'electron',
+      isDesktop: true,
+      capabilities: {
+        ...browserHost.capabilities,
+        windowControls: true,
+      },
+      window: {
+        ...browserHost.window,
+        startDragging: startDraggingMock,
+      },
+    }
+  }
+
   beforeEach(() => {
     class ResizeObserverMock {
       constructor(_callback: ResizeObserverCallback) {}
@@ -113,10 +131,8 @@ describe('TabBar', () => {
       value: ResizeObserverMock,
     })
 
-    Object.defineProperty(window, '__TAURI__', {
-      configurable: true,
-      value: {},
-    })
+    Reflect.deleteProperty(window, '__TAURI__')
+    installElectronDesktopHost()
 
     Object.defineProperty(window.HTMLElement.prototype, 'scrollIntoView', {
       configurable: true,
@@ -157,7 +173,8 @@ describe('TabBar', () => {
     useTerminalPanelStore.setState(useTerminalPanelStore.getInitialState(), true)
     useBrowserPanelStore.setState(useBrowserPanelStore.getInitialState(), true)
 
-    delete (window as typeof window & { __TAURI__?: unknown }).__TAURI__
+    Reflect.deleteProperty(window, 'desktopHost')
+    Reflect.deleteProperty(window, '__TAURI__')
   })
 
   it('scrolls the active tab into view when the active tab changes', async () => {
@@ -291,8 +308,12 @@ describe('TabBar', () => {
       render(<TabBar />)
     })
 
-    expect(screen.getByTestId('tab-bar')).not.toHaveAttribute('data-tauri-drag-region')
-    expect(screen.getByTestId('tab-bar-drag-gutter')).toHaveAttribute('data-tauri-drag-region')
+    expect(screen.getByTestId('tab-bar')).toHaveAttribute('data-desktop-drag-region')
+    expect(screen.getByTestId('tab-bar-scroll-region')).toHaveAttribute('data-desktop-drag-region')
+    expect(screen.getByTestId('tab-bar-drag-gutter')).toHaveAttribute('data-desktop-drag-region')
+    const tab = screen.getByText('Untitled Session').closest('.tab-bar-interactive')
+    expect(tab).toBeInTheDocument()
+    expect(tab).not.toHaveAttribute('data-desktop-drag-region')
   })
 
   it('keeps the desktop tab strip at a roomier titlebar height', async () => {
@@ -316,7 +337,7 @@ describe('TabBar', () => {
     })
 
     const tabBar = screen.getByTestId('tab-bar')
-    const tab = screen.getByText('Untitled Session').closest('.tab-bar-hit-area')
+    const tab = screen.getByText('Untitled Session').closest('.tab-bar-interactive')
 
     expect(tabBar).toHaveClass('min-h-11')
     expect(tab).toHaveClass('min-h-11')
@@ -452,7 +473,7 @@ describe('TabBar', () => {
   })
 
   it('hides the open-project control outside the desktop shell', async () => {
-    delete (window as typeof window & { __TAURI__?: unknown }).__TAURI__
+    Reflect.deleteProperty(window, 'desktopHost')
 
     const { TabBar } = await import('./TabBar')
     const { useTabStore } = await import('../../stores/tabStore')
@@ -490,7 +511,7 @@ describe('TabBar', () => {
     expect(screen.queryByTestId('open-project-menu')).not.toBeInTheDocument()
   })
 
-  it('starts dragging when clicking the empty tab-bar gutter', async () => {
+  it('marks the empty tab-bar gutter as a native drag region without runtime dragging', async () => {
     const { TabBar } = await import('./TabBar')
     const { useTabStore } = await import('../../stores/tabStore')
     const { useChatStore } = await import('../../stores/chatStore')
@@ -510,18 +531,13 @@ describe('TabBar', () => {
       render(<TabBar />)
     })
 
-    await waitFor(() => {
-      expect(getCurrentWindowMock).toHaveBeenCalled()
-    })
-
-    const scrollRegion = screen.getByTestId('tab-bar').querySelector('.overflow-x-hidden')
+    const scrollRegion = screen.getByTestId('tab-bar-scroll-region')
     expect(scrollRegion).toBeInTheDocument()
+    expect(scrollRegion).toHaveAttribute('data-desktop-drag-region')
 
-    fireEvent.mouseDown(scrollRegion!)
+    fireEvent.mouseDown(scrollRegion)
 
-    await waitFor(() => {
-      expect(startDraggingMock).toHaveBeenCalledTimes(1)
-    })
+    expect(startDraggingMock).not.toHaveBeenCalled()
   })
 
   it('does not start dragging when clicking a tab', async () => {
@@ -542,10 +558,6 @@ describe('TabBar', () => {
 
     await act(async () => {
       render(<TabBar />)
-    })
-
-    await waitFor(() => {
-      expect(getCurrentWindowMock).toHaveBeenCalled()
     })
 
     fireEvent.mouseDown(screen.getByText('Untitled Session'))
@@ -574,10 +586,10 @@ describe('TabBar', () => {
       render(<TabBar />)
     })
 
-    expect(screen.getByTestId('tab-bar').querySelector('.tab-bar-hit-area')).toBeInTheDocument()
+    expect(screen.getByTestId('tab-bar').querySelector('.tab-bar-interactive')).toBeInTheDocument()
 
-    const firstTab = screen.getByText('First Session').closest('.tab-bar-hit-area')
-    const secondTab = screen.getByText('Second Session').closest('.tab-bar-hit-area')
+    const firstTab = screen.getByText('First Session').closest('.tab-bar-interactive')
+    const secondTab = screen.getByText('Second Session').closest('.tab-bar-interactive')
 
     expect(firstTab).toBeTruthy()
     expect(secondTab).toBeTruthy()
@@ -622,7 +634,7 @@ describe('TabBar', () => {
       render(<TabBar />)
     })
 
-    const firstTab = screen.getByText('First Session').closest('.tab-bar-hit-area')
+    const firstTab = screen.getByText('First Session').closest('.tab-bar-interactive')
     expect(firstTab).toBeTruthy()
 
     fireEvent.mouseDown(firstTab!, { button: 0, clientX: 20, clientY: 10 })
@@ -656,7 +668,7 @@ describe('TabBar', () => {
       render(<TabBar />)
     })
 
-    const firstTab = screen.getByText('First Session').closest('.tab-bar-hit-area')
+    const firstTab = screen.getByText('First Session').closest('.tab-bar-interactive')
     const closeButton = screen.getByLabelText('Close First Session')
 
     expect(firstTab).toHaveClass('group')
@@ -947,15 +959,28 @@ describe('TabBar', () => {
     expect(useTabStore.getState().tabs).toEqual([])
   })
 
-  it('shows a running marker on tabs from tab status or live chat state', async () => {
+  it('shows a running marker on tabs from tab status, live chat state, or background tasks', async () => {
     const { TabBar } = await import('./TabBar')
     const { useTabStore } = await import('../../stores/tabStore')
     const { useChatStore } = await import('../../stores/chatStore')
+    const backgroundRunningSession = makeChatSession('idle')
+    backgroundRunningSession.backgroundAgentTasks = {
+      'agent-task-1': {
+        taskId: 'agent-task-1',
+        toolUseId: 'agent-tool-1',
+        status: 'running',
+        taskType: 'local_agent',
+        description: 'Review screenshots',
+        startedAt: 1,
+        updatedAt: 2,
+      },
+    }
 
     useTabStore.setState({
       tabs: [
         { sessionId: 'tab-status-running', title: 'Status Running', type: 'session', status: 'running' },
         { sessionId: 'tab-chat-running', title: 'Chat Running', type: 'session', status: 'idle' },
+        { sessionId: 'tab-background-running', title: 'Background Running', type: 'session', status: 'idle' },
         { sessionId: 'tab-idle', title: 'Idle', type: 'session', status: 'idle' },
       ],
       activeTabId: 'tab-status-running',
@@ -964,6 +989,7 @@ describe('TabBar', () => {
       sessions: {
         'tab-status-running': makeChatSession('idle'),
         'tab-chat-running': makeChatSession('thinking'),
+        'tab-background-running': backgroundRunningSession,
         'tab-idle': makeChatSession('idle'),
       },
       disconnectSession: vi.fn(),
@@ -973,7 +999,7 @@ describe('TabBar', () => {
       render(<TabBar />)
     })
 
-    expect(screen.getAllByLabelText('Session running')).toHaveLength(2)
+    expect(screen.getAllByLabelText('Session running')).toHaveLength(3)
     expect(screen.getByText('Idle').closest('[data-dragging]')?.querySelector('[aria-label="Session running"]')).toBeNull()
   })
 })
